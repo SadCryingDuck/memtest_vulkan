@@ -2,7 +2,7 @@
 
 Opensource cross-platform tool written in vulkan compute to stress test video memory for stability during overclocking or repair.
 
-Just start application, wait at least 6 minutes and stop testing by Ctrl+C. Detected errors are displayed immediately during test run.
+Just start the application and wait for the standard 5-minute test to finish, or stop it earlier with Ctrl+C. Detected errors are displayed immediately during the test run, and a summary with the result is shown at the end.
 
 Requires system-provided vulkan loader and driver supporting Vulkan 1.1 (already installed with graphics drivers on most OS).
 
@@ -40,6 +40,35 @@ memtest_vulkan: no any errors, testing PASSed.
   press any key to continue...
 </pre>
 </details>
+
+### Command line options
+
+All options are optional, `memtest_vulkan --help` lists them:
+
+| Option | Meaning |
+|---|---|
+| `-d, --device <N>` | Test GPU number N as shown in the list, without the selection prompt |
+| `-s, --size <SIZE>` | Memory to test, like `4G` or `512M` (default: all free VRAM) |
+| `-t, --duration <TIME>` | How long to test, like `30s`, `10m`, `2h` or `endless` (default: `5m`, the standard test) |
+| `-w, --window-mb <MB>` | Limit one test window to MB megabytes (128MB steps), to tell driver problems from memory errors |
+| `--log <FILE>`, `--no-log` | Log file location (default: `memtest_vulkan.log` in the current folder), or no log |
+| `-l, --list` | List the GPUs and exit |
+| `-b, --batch` | No prompts and no key press at the end, for scripts |
+| `-v, --verbose` | Print diagnostic information (renaming the executable to `memtest_vulkan_verbose` works too) |
+
+Press Ctrl+C once to stop testing and show the results, twice to quit at once. A test stopped after the standard 5 minutes still counts as complete.
+
+The exit code tells the result, which is useful in scripts (`memtest_vulkan --batch --duration 1h`):
+
+| Exit code | Meaning |
+|---|---|
+| 0 | test passed, no errors |
+| 1 | memory errors found |
+| 2 | results invalid: test writes didn't reach the memory (likely a driver problem, see [Troubleshooting](#troubleshooting)) |
+| 3 | the test couldn't run, or stopped because of a runtime error |
+| 4 | stopped before the test duration ended, no errors so far |
+
+The older form `memtest_vulkan <device> [<bytes>]` still works and tests without a time limit.
 
 ### Installation & Usage (Linux)
 
@@ -165,6 +194,10 @@ memtest_vulkan: no any errors, testing PASSed.
 
 The _only_ simple thing in result interpreting - is "If some errors are reported by memtest_vulkan - the PC has hardware problems". Most often GPU-related, but its hard to be sure if the problem is VRAM IC - related or GPU chip related.
 
+The summary at the end of the test also gives the *likely cause* the error pattern is typical of: single-bit flips concentrated on one bit point to one faulty data line or chip, scattered single-bit flips to unstable memory (overclock, undervolt, overheating), values reading as FFFFFFFF or whole corrupted values to severe instability. These are hints based on typical patterns, not a diagnosis.
+
+If the test warns that a test window reads many times slower than the others, the driver placed that part of the test memory in system RAM, usually because other programs use the VRAM. That part of the test then checks system RAM instead of VRAM: close other programs using the GPU or test less memory with `--size`.
+
 You can create [topic in discussions](https://github.com/GpuZelenograd/memtest_vulkan/discussions/new?category=card-specific-memtest_vulkan-error-logs), sometimes the error log can be interpreted. Bust most of the time it is quite complex task, expand the theory section below
 
 <details><summary>
@@ -201,25 +234,25 @@ TogglCnt                2|   7  18   95 264| 8451786 40056770| 11k 15k  20k 23k
 * Near-the-limit, rare-occurring errors. When hardware is working near its limits, the errors can present but be fairly rare or depend on the outer factors like "electrical power network noise caused by powering on a drill in a nearby office". Catching such errors may require 2-3 hours of test run.
 * Lower-frequency errors. Sometimes faulty memory or GPU can handle high-performance "huge frequency and medium timings" mode but fails to handle the low-performance "low frequency and small timings" mode. Such errors are hard to catch; the standard 5-6 minute test sometimes catches them during a special "several seconds pause of load" at the beginning of the 5-th minute, but that is not a reliable method.
 * Frequency-switch errors. The GPU+memory may work fine at both high- and low-performance modes, but it may fail at the moment of the switching while clocks and timings are adjusted. Similar to above, hard to catch, sometimes caught at the beginning of the 5th minute.
-Testing mode for the two later categories is still under development - it's tricky to check memory operation at lower frequency, since the driver nearly immediate switches to performance mode when load begins. However, v0.5 introduces a preliminary attempt to handle this. After initial pre-heat, the load is stopped for 15 seconds and then raises again.
+Testing mode for the two later categories is still under development - it's tricky to check memory operation at lower frequency, since the driver nearly immediate switches to performance mode when load begins. However, v0.5 introduces a preliminary attempt to handle this. After initial pre-heat, 30 seconds before the end of the test (of the standard 5 minutes for longer tests), the load is stopped for 15 seconds, then all the memory is checked again without rewriting it (reported as Mode AFTER_PAUSE) and the load raises again.
 </details>
 
 # <a id="troubleshooting">Troubleshooting & reporting bugs</a>
 Here is the list of common errors that prevent test from starting
-* `memtest_vulkan: early exit during init: The library failed to load`<br>
+* `memtest_vulkan couldn't start testing: ... failed to load`<br>
 This message means that your system lacks the Khronos Group Vulkan-Loader library. This library is used as a multiplexer between different drivers provided for different devices and typically is installed during installation of any device-specific vulkan driver. However, some platforms may need explicit installation: for example, to install it on ubuntu 18.04 run `sudo apt install libvulkan1`.
 Note that this library itself doesn't depend on any GPU, it is loadable even without any vulkan-capable devices at all. So the error above is a pure software-related error, not related to hardware at all. For windows7 x64 you may need [downloading `vulkan-1.dll` manually](https://github.com/GpuZelenograd/memtest_vulkan/releases/tag/support).
-* `memtest_vulkan: early exit during init: ERROR_INCOMPATIBLE_DRIVER`<br>
-`memtest_vulkan: early exit during init: ERROR_INITIALIZATION_FAILED`<br>
+* `memtest_vulkan couldn't start testing: ERROR_INCOMPATIBLE_DRIVER`<br>
+`memtest_vulkan couldn't start testing: ERROR_INITIALIZATION_FAILED`<br>
 Those messages mean that your system lacks the vulkan driver for your GPU or your system doesn't have any vulkan-capable devices. If the device is known to be vulkan-capable try removing all GPU drivers and reinstalling/updating a driver for the device you want to test.
 * `Runtime error: This device lacks support for DEVICE_LOCAL+HOST_COHERENT memory type.`<br>
 Typical causes are software or hardware not supported by memtets_vulkan:
   * Emulator/translator usage: if the tested GPU name in the output mentions something like `Microsoft Direct3D12 (model name)` — the translator similar to Mesa Dozen “Vulkan-over-Direct3D12” is used, maybe installed as “OpenCL, OpenGL and Vulkan Compatibility Pack”. If several devices are listed on the memtest_vulkan startup, try selecting another driver variant.
   * Pre-2016 GPU: Some older GPUs are not supported due to driver limitations, like GTX780Ti on Windows even with the latest 472.xx driver
   * Old OS/driver: Windows 7 with 47x.xx driver has driver limitations even with post-2016 GPUs that are supported in newer environments.
-* `Runtime error: Failed determining memory budget` on the integrated GPU <br>
+* `Couldn't determine how much memory to test` on the integrated GPU <br>
 If the integrated GPU is configured with fixed & quite low dedicated memory size - it may be shown in memtest_vulkan output only with 1GB VRAM: `1GB AMD Radeon(TM) Vega 3 Graphics` and then fail. The vulkan implementation for integrated GPUs allows using a bit less memory than reserved, and memtest_vulkan requires at least 1GB available memory to operate. Reconfigure integrated GPU to reserve at least 1.5GB of memory, see [issue #22](https://github.com/GpuZelenograd/memtest_vulkan/issues/22)
-* `INIT OR FIRST testing failed due to runtime error` <br>
+* `the test couldn't run because of a runtime error` <br>
 If the test fails to start and shows this message for a newer GPU - there is some incompatibility in vulkan installation. This may be caused by outdated driver or conflicts between several vulkan drivers installed. <br> <br>
 For example on Linux the test can be run with a specific ICD the following way:<br>
 `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json ./memtest_vulkan`<br>
@@ -230,7 +263,7 @@ There are some reports that testing AMD GPUs sometimes gives unexpectedly low GP
 
 Also, some drivers don't allow single memory allocations or buffers bigger than ~4GB (`maxMemoryAllocationSize`/`maxBufferSize`), even on a GPU with a lot of memory. The tested memory is split into windows of at most 3.875GB, each with its own allocation and buffer kept within the limits the driver reports, so the whole memory is still tested.
 
-If the test reports `WRITES NOT APPLIED`, it found a big contiguous block (1MB or more) of memory the test never managed to write to: it still holds the marker written before the test pattern, the data of the previous pass, or reads as all zeros. Faulty VRAM gives scattered errors instead, so this is most likely a GPU driver or memtest_vulkan problem and the results of that run are invalid. Try limiting the window size with the `MEMTEST_VULKAN_MAX_WINDOW_MB` environment variable (for example `MEMTEST_VULKAN_MAX_WINDOW_MB=512`, rounded down to 128MB steps) or another driver version. If errors disappear with smaller windows, they were caused by the driver, not the memory. If they persist everywhere, the GPU itself may be faulty.
+If the test reports `WRITES NOT APPLIED`, it found a big contiguous block (1MB or more) of memory the test never managed to write to: it still holds the marker written before the test pattern, the data of the previous pass, or reads as all zeros. Faulty VRAM gives scattered errors instead, so this is most likely a GPU driver or memtest_vulkan problem and the results of that run are invalid. Try limiting the window size with `--window-mb 512` (or the `MEMTEST_VULKAN_MAX_WINDOW_MB` environment variable, rounded down to 128MB steps) or another driver version. If errors disappear with smaller windows, they were caused by the driver, not the memory. If they persist everywhere, the GPU itself may be faulty.
 
 If nothing helps - enable verbose mode by renaming the executable to `memtest_vulkan_verbose` and running again. The test will output diagnostic information to stdout - please copy it to a new issue at https://github.com/GpuZelenograd/memtest_vulkan/issues.
 
