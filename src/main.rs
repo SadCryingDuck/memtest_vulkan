@@ -10,7 +10,7 @@ use byte_strings::c_str;
 use core::cmp::{max, min};
 use erupt::{
     DeviceLoader, ExtendableFrom, InstanceLoader, ObjectHandle,
-    extensions::{ext_debug_utils, ext_memory_budget, ext_pci_bus_info},
+    extensions::{ext_debug_utils, ext_memory_budget, ext_pci_bus_info, khr_maintenance4},
     vk,
 };
 use erupt_vendored_utils_loading::{EntryLoader, new_loader};
@@ -84,24 +84,38 @@ struct IOBuf
     done_iter_or_err: u32,
     iter: u32,
     calc_param: u32,
+    unwritten_count: u32,
+    prev_calc_param: u32,
+    check_stale: u32,
+    reserved: u32,
     first_elem: vec4<u32>
 }
 
 @group(0) @binding(0) var<storage, read_write> io: IOBuf;
 @group(0) @binding(1) var<storage, read_write> test: array<vec4<u32>>;
 
-fn addr_value_by_index(i:u32)->vec4<u32>
+// Must match WRITE_MARKER on the CPU side: windows are filled with it before their initial write
+let WRITE_MARKER: u32 = 0xA5C396E1u;
+
+fn addr_value_by_index(i:u32, calc_param:u32)->vec4<u32>
 {
-    let effective_index_of_u32 = i * 4u + io.calc_param;
+    let effective_index_of_u32 = i * 4u + calc_param;
     return vec4<u32>(effective_index_of_u32 + 1u, effective_index_of_u32 + 2u, effective_index_of_u32 + 3u, effective_index_of_u32 + 4u);
+}
+
+fn test_value_for_param(i:u32, calc_param:u32)->vec4<u32>
+{
+    let addrs : vec4<u32> = addr_value_by_index(i, calc_param);
+    let shifts : vec4<u32> = addrs % 31u;
+    // (32u - shifts) % 32u keeps the right shift below 32, since shifting by 32 is undefined in SPIR-V.
+    // With shifts == 0 this yields addrs | addrs == addrs, matching check_vec_first on the CPU side.
+    let rotated : vec4<u32> = (addrs << shifts) | (addrs >> ((32u - shifts) % 32u));
+    return rotated;
 }
 
 fn test_value_by_index(i:u32)->vec4<u32>
 {
-    let addrs : vec4<u32> = addr_value_by_index(i);
-    let shifts : vec4<u32> = addrs % 31u;
-    let rotated : vec4<u32> = (addrs << shifts) | (addrs >> (32u - shifts));
-    return rotated;
+    return test_value_for_param(i, io.calc_param);
 }
 
 
@@ -118,11 +132,16 @@ fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let expected_value : vec4<u32> = test_value_by_index(effective_addr);
     if any(actual_value != expected_value) {
         //slow path, executed only on errors found
+        // what this memory held before the last write: lets us tell "write never landed" from corruption
+        let stale_value : vec4<u32> = test_value_for_param(effective_addr, io.prev_calc_param);
         for(var i: i32 = 0; i < 4; i++) {
             let actual_u32 = actual_value[i];
             let error_mask = actual_u32 ^ expected_value[i];
             if error_mask == 0 {
                 continue;
+            }
+            if actual_u32 == WRITE_MARKER || (io.check_stale != 0u && actual_u32 == stale_value[i]) {
+                atomicAdd(&io.unwritten_count, 1u);
             }
             let one_bits = countOneBits(error_mask);
             if one_bits == 1
@@ -193,6 +212,21 @@ const MIN_WANTED_ALLOCATION: i64 = TEST_DATA_KEEP_FREE;
 const ALLOCATION_TRY_STEP: i64 = TEST_DATA_KEEP_FREE;
 
 const MAP_FOR_GETTING_ADDRESS_SIZE: u64 = 2 * 1024 * 1024; // signle huge page
+
+/// Environment variable limiting a single test window size, in megabytes (rounded down to 128MB steps)
+const MAX_WINDOW_MB_ENV: &str = "MEMTEST_VULKAN_MAX_WINDOW_MB";
+/// Environment variable skipping one write pass, to check the "writes not applied" detection:
+/// 0 skips the initial write of the last window, N>0 skips writing window 1 on iteration N
+const EMULATE_SKIPPED_WRITE_ENV: &str = "MEMTEST_VULKAN_EMULATE_SKIPPED_WRITE_ITERATION";
+
+/// Value every test window is filled with before its first write. The test pattern practically
+/// never equals it, so reading it back means the write never reached memory. Must match the shader.
+const WRITE_MARKER: u32 = 0xA5C3_96E1;
+/// A contiguous block of at least this many u32 values that all read back as the marker,
+/// the previous pass's data or exactly zero (the way out-of-bounds access behaves) is treated
+/// as never written rather than as faulty VRAM, which gives scattered errors instead.
+/// 0x40000 values = 1MB.
+const UNWRITTEN_BLOCK_MIN_WORDS: i64 = 0x40000;
 
 struct ComputePipelines {
     read: vk::Pipeline,
@@ -299,15 +333,44 @@ struct IOBuf {
     done_iter_or_err: u32,
     iter: u32,
     calc_param: u32,
+    /// wrong values that look like the write never reached memory (marker or previous pass data)
+    unwritten_count: u32,
+    /// calc_param of the data held in this window before the last write
+    prev_calc_param: u32,
+    /// nonzero if the window was rewritten since the previous pass, so prev_calc_param data is stale
+    check_stale: u32,
+    reserved: u32, // keeps first_elem 16-byte aligned like vec4 in WGSL
     first_elem: MostlyZeroArr<VEC_SIZE>,
+}
+
+// IOBuf must have the same layout as the WGSL struct: 3*32 + 12 u32 fields + vec4
+const _: () = assert!(mem::size_of::<IOBuf>() == (3 * 32 + 12 + 4) * 4);
+
+/// Why a window's wrong values look like writes that never reached memory
+#[derive(Debug, PartialEq)]
+enum UnwrittenEvidence {
+    /// values still hold the pre-write marker or the data of the previous pass
+    MarkerOrStale(i64),
+    /// a big contiguous block reads entirely as zero
+    ZeroBlock(i64),
 }
 
 impl fmt::Display for IOBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.actual_min <= self.actual_max {
+            write!(
+                f,
+                "values range: 0x{:08X}..=0x{:08X}",
+                self.actual_min, self.actual_max
+            )?;
+        } else {
+            // only FFFFFFFF-like wrong values were seen, so min/max were never updated
+            write!(f, "values range: none (only FFFFFFFF-like)")?;
+        }
         writeln!(
             f,
-            "values range: 0x{:08X}..=0x{:08X}   FFFFFFFF-like count:{}    bit-level stats table:",
-            self.actual_max, self.actual_min, self.actual_ff
+            "   FFFFFFFF-like count:{}    bit-level stats table:",
+            self.actual_ff
         )?;
         writeln!(
             f,
@@ -332,12 +395,43 @@ impl IOBuf {
         self.set_calc_param_for_starting_window();
     }
     fn set_calc_param_for_starting_window(&mut self) {
-        self.calc_param = self.iter.wrapping_mul(0x100107);
+        self.calc_param = Self::calc_param_for(self.iter, 0);
+    }
+    /// calc_param used to write window `window_idx` on iteration `iter` of the main loop
+    fn calc_param_for(iter: u32, window_idx: i64) -> u32 {
+        iter.wrapping_mul(0x100107)
+            .wrapping_add(window_idx as u32 * 0x81_u32)
+    }
+    /// Recognizes errors caused by writes that never reached memory - typically a driver or
+    /// tool problem. Only a big contiguous block counts: real memory faults (including unstable
+    /// memory where single writes don't stick) give scattered errors instead, so these
+    /// must stay reported as memory errors.
+    fn unwritten_evidence(&self) -> Option<UnwrittenEvidence> {
+        if self.idx_min > self.idx_max {
+            return None; // no errors recorded
+        }
+        let range_words = self.idx_max as i64 - self.idx_min as i64 + 1;
+        // practically every value in the error range is affected
+        // (allowing a few values whose expected pattern equals the read one, so aren't errors)
+        let is_contiguous_block = |words: i64| {
+            range_words >= UNWRITTEN_BLOCK_MIN_WORDS && words * 1000 >= range_words * 999
+        };
+        let unwritten_words = self.unwritten_count as i64;
+        if is_contiguous_block(unwritten_words) {
+            return Some(UnwrittenEvidence::MarkerOrStale(unwritten_words));
+        }
+        let zero_words = self.mem_bitcount.0[0] as i64; // values with no bits set
+        if is_contiguous_block(zero_words) {
+            return Some(UnwrittenEvidence::ZeroBlock(zero_words));
+        }
+        None
     }
     fn reset_errors(&mut self) {
         *self = IOBuf {
             iter: self.iter,
             calc_param: self.calc_param,
+            prev_calc_param: self.prev_calc_param,
+            check_stale: self.check_stale,
             idx_max: u32::MIN,
             idx_min: u32::MAX,
             actual_max: u32::MIN,
@@ -352,11 +446,13 @@ impl IOBuf {
         if self.done_iter_or_err == self.iter {
             None
         } else {
-            let total_errors = self.mem_bitcount.0.iter().sum::<u32>() as i64;
+            // wrong values reading as FFFFFFFF are counted only in actual_ff, not in mem_bitcount
+            let total_errors =
+                self.mem_bitcount.0.iter().map(|&v| v as i64).sum::<i64>() + self.actual_ff as i64;
             Some((
                 std::ops::RangeInclusive::<U64HexDebug>::new(
                     U64HexDebug(buf_offset + self.idx_min as i64 * ELEMENT_SIZE),
-                    U64HexDebug(buf_offset + (self.idx_max + 1) as i64 * ELEMENT_SIZE - 1),
+                    U64HexDebug(buf_offset + (self.idx_max as i64 + 1) * ELEMENT_SIZE - 1),
                 ),
                 total_errors,
             ))
@@ -365,7 +461,10 @@ impl IOBuf {
     #[allow(clippy::manual_rotate)] // this is kept as similar to WGSL shader above as possible
     fn check_vec_first(&self) -> Result<(), Box<dyn std::error::Error>> {
         const TEST_IDX: u32 = 1;
-        let addr: u32 = TEST_IDX * VEC_SIZE as u32 + self.calc_param + 1u32;
+        // wrapping like u32 arithmetic in the shader (avoids overflow panics in debug builds)
+        let addr: u32 = self
+            .calc_param
+            .wrapping_add(TEST_IDX * VEC_SIZE as u32 + 1u32);
         let shift = addr % 31u32;
         let rotated = if shift > 0 {
             addr << shift | addr >> (32 - shift)
@@ -482,7 +581,14 @@ impl<T> MapErrRetryWithLowerMemory for erupt::utils::VulkanResult<T> {
             if !env.interactive
                 && !close::check_any_bits_set(close::fetch_status(), close::app_status::INITED_OK)
             {
-                if env.verbose() {
+                let out_of_memory = matches!(
+                    res,
+                    vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                );
+                // Running out of memory is expected while searching for the testable size.
+                // Other errors (like ERROR_DEVICE_LOST after a GPU hang/driver reset) may indicate
+                // instability, so always show them instead of retrying silently.
+                if env.verbose() || !out_of_memory {
                     println!("Retrying with lower memory due to {}", msg);
                 }
                 //immediate exit in non-interactive during init to initiate try with lower memory
@@ -510,7 +616,8 @@ fn memory_requirements(
 ) -> Result<(vk::MemoryRequirements, vk::BufferCreateInfoBuilder<'_>), Box<dyn std::error::Error>> {
     let test_buffer_create_info = vk::BufferCreateInfoBuilder::new()
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+        // TRANSFER_DST: windows are filled with WRITE_MARKER before their first write
+        .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
         .size(min_wanted_allocation as u64);
     let test_buffer =
         unsafe { device.create_buffer(&test_buffer_create_info, None) }.err_as_str()?;
@@ -521,19 +628,53 @@ fn memory_requirements(
 
 fn free_test_mem_and_buffers(
     device: &erupt::DeviceLoader,
-    buffer: &mut Option<vk::Buffer>,
-    memory: &mut Option<vk::DeviceMemory>,
+    buffers: &mut Vec<vk::Buffer>,
+    memories: &mut Vec<vk::DeviceMemory>,
 ) {
-    if let Some(some_buffer) = buffer.take() {
+    for some_buffer in buffers.drain(..) {
         unsafe {
             device.destroy_buffer(some_buffer, None);
         }
     }
-    if let Some(some_memory) = memory.take() {
+    for some_memory in memories.drain(..) {
         unsafe {
             device.free_memory(some_memory, None);
         }
     }
+}
+
+/// Allocates a separate memory block and buffer for every test window.
+/// A single huge allocation/buffer would exceed maxMemoryAllocationSize/maxBufferSize on drivers
+/// limiting them to ~4GB (like Intel Arc), which silently drops part of the writes and makes
+/// untouched (zero) memory look like memory errors.
+#[allow(clippy::too_many_arguments)]
+fn allocate_test_windows(
+    device: &erupt::DeviceLoader,
+    env: &ProcessEnv,
+    test_buffer_create_info: vk::BufferCreateInfoBuilder<'_>,
+    test_mem_index: u32,
+    test_window_size: i64,
+    test_window_count: i64,
+    buffers: &mut Vec<vk::Buffer>,
+    memories: &mut Vec<vk::DeviceMemory>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..test_window_count {
+        let buffer = unsafe {
+            device.create_buffer(&test_buffer_create_info.size(test_window_size as u64), None)
+        }
+        .err_retry_with_lower_memory(env, "create_buffer")?;
+        buffers.push(buffer);
+        let buffer_reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let allocate_info = vk::MemoryAllocateInfoBuilder::new()
+            .allocation_size(buffer_reqs.size)
+            .memory_type_index(test_mem_index);
+        let memory = unsafe { device.allocate_memory(&allocate_info, None) }
+            .err_retry_with_lower_memory(env, "allocate_memory")?;
+        memories.push(memory);
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
+            .err_retry_with_lower_memory(env, "bind_buffer_memory")?;
+    }
+    Ok(())
 }
 fn try_fill_default_mem_budget<Writer: std::io::Write>(
     selected_device: &NamedComputeDevice,
@@ -698,14 +839,72 @@ fn prepare_and_test_device<Writer: std::io::Write>(
         &pipeline_layout,
         &pipelines,
         log_dupler,
-        &selected.label,
-        selected.memory_props,
-        selected.physical_props,
+        selected,
         env,
     ) {
         display_this_process_result(Some(e), env)
     }
     display_this_process_result(None, env)
+}
+
+/// Logs the errors found by a read pass over one test window.
+/// Returns true (and raises the RUNTIME_ERRORS status bit) if there were any.
+fn report_window_errors<Writer: std::io::Write>(
+    log_dupler: &mut output::LogDupler<Writer>,
+    buffer_out: &IOBuf,
+    test_offset: i64,
+    test_window_size: i64,
+    mode: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some((error_range, total_errors)) = buffer_out.get_error_addresses_and_count(test_offset)
+    else {
+        return Ok(false);
+    };
+    let unwritten = buffer_out.unwritten_evidence();
+    let unwritten_words = match unwritten {
+        Some(UnwrittenEvidence::MarkerOrStale(count) | UnwrittenEvidence::ZeroBlock(count)) => {
+            count
+        }
+        None => 0,
+    };
+    if unwritten.is_some() {
+        close::raise_status_bit(close::app_status::WRITES_NOT_APPLIED);
+    }
+    if total_errors > unwritten_words {
+        // wrong values that can't be explained by missing writes
+        close::raise_status_bit(close::app_status::RUNTIME_ERRORS);
+    }
+    let test_elems = test_window_size / ELEMENT_SIZE;
+    write!(
+        log_dupler,
+        "Error found. Mode {}, total errors 0x{:X} out of 0x{:X} ({:2.8}%)\nErrors address range: {:?}",
+        mode,
+        total_errors,
+        test_elems,
+        total_errors as f64 / test_elems as f64 * 100.0f64,
+        error_range,
+    )?;
+    writeln!(
+        log_dupler,
+        "  iteration:{}\n{}",
+        buffer_out.iter, buffer_out
+    )?;
+    if let Some(evidence) = unwritten {
+        let reason = match evidence {
+            UnwrittenEvidence::MarkerOrStale(_) => {
+                "still hold the pre-write marker or the previous pass's data"
+            }
+            UnwrittenEvidence::ZeroBlock(_) => "form one contiguous block reading exactly zero",
+        };
+        writeln!(
+            log_dupler,
+            "WRITES NOT APPLIED: 0x{unwritten_words:X} of these wrong values {reason}.\n\
+             The test's writes never reached this memory. This is most likely a GPU driver or memtest_vulkan\n\
+             problem rather than faulty VRAM. Retry with {MAX_WINDOW_MB_ENV}=512 or another driver version;\n\
+             if it persists, the GPU itself may be faulty.",
+        )?;
+    }
+    Ok(true)
 }
 
 fn test_device<Writer: std::io::Write>(
@@ -716,15 +915,20 @@ fn test_device<Writer: std::io::Write>(
     pipeline_layout: &vk::PipelineLayout,
     pipelines: &ComputePipelines,
     log_dupler: &mut output::LogDupler<Writer>,
-    selected_label: &String,
-    memory_props: vk::PhysicalDeviceMemoryProperties,
-    physical_props: vk::PhysicalDeviceProperties,
+    selected: &NamedComputeDevice,
     env: &ProcessEnv,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let selected_label = &selected.label;
+    let memory_props = selected.memory_props;
+    let physical_props = selected.physical_props;
     let mut allocation_size = env.max_test_bytes.load(SeqCst);
     if allocation_size < MIN_WANTED_ALLOCATION {
         return Err("requested test size is smaller than minimum wanted".into());
     }
+    // allow emulating writes that never reach memory, for testing the detection of it
+    let skip_write_iteration = env::var(EMULATE_SKIPPED_WRITE_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok());
 
     let io_data_size = mem::size_of::<IOBuf>() as vk::DeviceSize;
 
@@ -828,129 +1032,229 @@ fn test_device<Writer: std::io::Write>(
         unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.err_as_str()?;
 
     let submit_info = &[vk::SubmitInfoBuilder::new().command_buffers(&cmd_bufs)];
+
+    // Every window is a separate allocation and buffer, bound as one storage buffer descriptor.
+    // So a window must fit in maxStorageBufferRange, maxMemoryAllocationSize and maxBufferSize.
+    // Exceeding them is invalid usage, and on some drivers it silently drops writes,
+    // which then shows up as false memory errors.
+    let storage_range_limit = physical_props.limits.max_storage_buffer_range as i64;
+    let size_limits = selected.size_limits;
+    // Manual cap of the window size, for diagnosing drivers that mishandle big buffers
+    // (if errors disappear with smaller windows, the problem isn't the VRAM).
+    let window_size_override = env::var(MAX_WINDOW_MB_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&mb| mb > 0)
+        .map(|mb| max(mb.saturating_mul(1024 * 1024), TEST_WINDOW_SIZE_GRANULARITY));
+    if let Some(override_size) = window_size_override {
+        writeln!(
+            log_dupler,
+            "Test window size limited to {}MB by {MAX_WINDOW_MB_ENV}",
+            (override_size - override_size % TEST_WINDOW_SIZE_GRANULARITY) / (1024 * 1024)
+        )?;
+    }
+    let max_window_size = [
+        Some(storage_range_limit),
+        size_limits.max_memory_allocation_size,
+        size_limits.max_buffer_size,
+        window_size_override,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|limit| limit - limit % TEST_WINDOW_SIZE_GRANULARITY)
+    .fold(TEST_WINDOW_MAX_SIZE, min);
+    if max_window_size < TEST_WINDOW_SIZE_GRANULARITY {
+        return Err(format!(
+            "device limits (maxStorageBufferRange 0x{storage_range_limit:X}, {size_limits:?}) are smaller than the minimal test window 0x{TEST_WINDOW_SIZE_GRANULARITY:X}"
+        )
+        .into());
+    }
+    if env.verbose() {
+        let _ = writeln!(
+            log_dupler,
+            "maxStorageBufferRange 0x{storage_range_limit:X}, {size_limits:?}, max test window {:5.3}GB",
+            max_window_size as f32 / GB
+        );
+    }
+
     //all preparations except huge buffer allocation done. Now allocate huge buffer as a last step to minize chance of allocation failure for small structures
 
-    let mut test_memory = None;
-    let mut test_buffer = None;
+    let mut test_memories: Vec<vk::DeviceMemory> = Vec::new();
+    let mut test_buffers: Vec<vk::Buffer> = Vec::new();
     let mut test_window_count;
     let mut test_window_size;
     let mut warn_on_budget_alloc_fail = true;
     let mut execute_wait_queue;
+    let mut init_errors_found = false;
 
     //The error state before all allocation tries
     let mut last_err: Box<dyn std::error::Error> =
         "No heap reports memory enough for testing".into();
     'memsize: loop {
-        free_test_mem_and_buffers(device, &mut test_buffer, &mut test_memory);
+        free_test_mem_and_buffers(device, &mut test_buffers, &mut test_memories);
 
         if allocation_size < MIN_WANTED_ALLOCATION {
             return Err(last_err);
         }
 
-        let test_memory_allocate_info = vk::MemoryAllocateInfoBuilder::new()
-            .allocation_size(allocation_size as u64)
-            .memory_type_index(test_mem_index);
+        test_window_count =
+            allocation_size / max_window_size + i64::from(allocation_size % max_window_size != 0);
+        test_window_count = max(test_window_count, 2); //at least 2 windows: for testing rereads and rws
+        test_window_size = allocation_size / test_window_count;
+        test_window_size = test_window_size - test_window_size % TEST_WINDOW_SIZE_GRANULARITY;
         if env.verbose() {
             let _ = writeln!(
                 log_dupler,
-                "Trying {:7.3}GB buffer...",
-                allocation_size as f32 / GB
+                "Trying {:7.3}GB as {} windows of {:5.3}GB...",
+                allocation_size as f32 / GB,
+                test_window_count,
+                test_window_size as f32 / GB
             );
         }
-        match unsafe { device.allocate_memory(&test_memory_allocate_info, None) }
-            .err_retry_with_lower_memory(env, "allocate_memory")
-        {
+        match allocate_test_windows(
+            device,
+            env,
+            test_buffer_create_info,
+            test_mem_index,
+            test_window_size,
+            test_window_count,
+            &mut test_buffers,
+            &mut test_memories,
+        ) {
             Err(err) => last_err = err,
-            Ok(some_memory) => {
-                test_memory = Some(some_memory);
-                test_window_count = allocation_size / TEST_WINDOW_MAX_SIZE
-                    + i64::from(allocation_size % TEST_WINDOW_MAX_SIZE != 0);
-                test_window_count = max(test_window_count, 2); //at least 2 windows: for testing rereads and rws
-                test_window_size = allocation_size / test_window_count;
-                test_window_size =
-                    test_window_size - test_window_size % TEST_WINDOW_SIZE_GRANULARITY;
-                let test_data_size = test_window_size * test_window_count;
-
-                match unsafe {
-                    device.create_buffer(&test_buffer_create_info.size(test_data_size as u64), None)
-                }
-                .err_retry_with_lower_memory(env, "create_buffer")
-                {
-                    Err(err) => last_err = err,
-                    Ok(some_buffer) => {
-                        test_buffer = Some(some_buffer);
-                        match unsafe { device.bind_buffer_memory(some_buffer, some_memory, 0) }
-                            .err_retry_with_lower_memory(env, "bind_buffer_memory")
-                        {
-                            Err(err) => last_err = err,
-                            Ok(_) => {
-                                execute_wait_queue = |buf_offset: i64, pipeline: vk::Pipeline| -> Result<(), Box<dyn std::error::Error>> {
-                                    let test_element_count = (test_window_size / ELEMENT_SIZE) as u32;
-                                    unsafe {
-                                        device.update_descriptor_sets(
-                                            &[vk::WriteDescriptorSetBuilder::new()
-                                                .dst_set(desc_sets[0])
-                                                .dst_binding(1)
-                                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                                                .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
-                                                    .buffer(test_buffer.unwrap())
-                                                    .offset(buf_offset as u64)
-                                                    .range(test_window_size as u64)])],
-                                            &[],
-                                        );
-                                        let cmd_buf = cmd_bufs[0];
-                                        device
-                                            .begin_command_buffer(cmd_buf, &vk::CommandBufferBeginInfo::default())
-                                            .err_retry_with_lower_memory(env, "begin_command_buffer")?;
-                                        device.cmd_bind_pipeline(cmd_buf, vk::PipelineBindPoint::COMPUTE, pipeline);
-                                        device.cmd_bind_descriptor_sets(
-                                            cmd_buf,
-                                            vk::PipelineBindPoint::COMPUTE,
-                                            *pipeline_layout,
-                                            0,
-                                            &desc_sets,
-                                            &[],
-                                        );
-                                        device.cmd_dispatch(
-                                            cmd_buf,
-                                            (TEST_WINDOW_1D_MAX_GROUPS / WG_SIZE) as u32,
-                                            test_element_count / VEC_SIZE as u32 / TEST_WINDOW_1D_MAX_GROUPS as u32,
-                                            1,
-                                        );
-                                        device.end_command_buffer(cmd_buf).err_retry_with_lower_memory(env, "end_command_buffer")?;
-                                        device
-                                            .queue_submit(queue, submit_info, fence)
-                                            .err_retry_with_lower_memory(env, "queue_submit")?;
-                                        device
-                                            .wait_for_fences(&[fence], true, u64::MAX)
-                                            .err_retry_with_lower_memory(env, "wait_for_fences")?;
-                                        device.reset_fences(&[fence]).err_retry_with_lower_memory(env, "reset_fences")?;
-                                        Ok(())
-                                    }
-                                };
-                                unsafe { std::ptr::write(mapped, IOBuf::for_initial_iteration()) }
-                                //try to do initial memory fill to verify that allocation is really usable
-                                let mut overall_exec_result = Ok(());
-                                'window: for window_idx in 0..test_window_count {
-                                    let test_offset = test_window_size * window_idx;
-                                    if let Err(e) = execute_wait_queue(test_offset, pipelines.write)
-                                    {
-                                        overall_exec_result = Err(e);
-                                        break 'window;
-                                    }
-                                    if let Err(e) = execute_wait_queue(test_offset, pipelines.read)
-                                    {
-                                        overall_exec_result = Err(e);
-                                        break 'window;
-                                    }
-                                }
-                                match overall_exec_result {
-                                    Err(e) => last_err = e,
-                                    Ok(()) => break 'memsize,
-                                }
-                            }
+            Ok(()) => {
+                // fill_marker: first fill the window with WRITE_MARKER (used before its initial write)
+                // pipeline: None records no dispatch (used by the skipped-write emulation)
+                execute_wait_queue = |window_idx: i64,
+                                      fill_marker: bool,
+                                      pipeline: Option<vk::Pipeline>|
+                 -> Result<(), Box<dyn std::error::Error>> {
+                    let test_element_count = (test_window_size / ELEMENT_SIZE) as u32;
+                    unsafe {
+                        device.update_descriptor_sets(
+                            &[vk::WriteDescriptorSetBuilder::new()
+                                .dst_set(desc_sets[0])
+                                .dst_binding(1)
+                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
+                                    .buffer(test_buffers[window_idx as usize])
+                                    .offset(0)
+                                    .range(test_window_size as u64)])],
+                            &[],
+                        );
+                        let cmd_buf = cmd_bufs[0];
+                        device
+                            .begin_command_buffer(cmd_buf, &vk::CommandBufferBeginInfo::default())
+                            .err_retry_with_lower_memory(env, "begin_command_buffer")?;
+                        if fill_marker {
+                            device.cmd_fill_buffer(
+                                cmd_buf,
+                                test_buffers[window_idx as usize],
+                                0,
+                                vk::WHOLE_SIZE,
+                                WRITE_MARKER,
+                            );
+                            // the fill must complete before the shader writes/reads the window
+                            device.cmd_pipeline_barrier(
+                                cmd_buf,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::DependencyFlags::empty(),
+                                &[vk::MemoryBarrierBuilder::new()
+                                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                    .dst_access_mask(
+                                        vk::AccessFlags::SHADER_READ
+                                            | vk::AccessFlags::SHADER_WRITE,
+                                    )],
+                                &[],
+                                &[],
+                            );
                         }
+                        if let Some(pipeline) = pipeline {
+                            device.cmd_bind_pipeline(
+                                cmd_buf,
+                                vk::PipelineBindPoint::COMPUTE,
+                                pipeline,
+                            );
+                            device.cmd_bind_descriptor_sets(
+                                cmd_buf,
+                                vk::PipelineBindPoint::COMPUTE,
+                                *pipeline_layout,
+                                0,
+                                &desc_sets,
+                                &[],
+                            );
+                            device.cmd_dispatch(
+                                cmd_buf,
+                                (TEST_WINDOW_1D_MAX_GROUPS / WG_SIZE) as u32,
+                                test_element_count
+                                    / VEC_SIZE as u32
+                                    / TEST_WINDOW_1D_MAX_GROUPS as u32,
+                                1,
+                            );
+                        }
+                        // Make shader writes to the IO buffer visible to the host:
+                        // waiting on the fence alone doesn't guarantee host visibility per the Vulkan spec,
+                        // and a stale IO buffer would be reported as a memory error.
+                        device.cmd_pipeline_barrier(
+                            cmd_buf,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::HOST,
+                            vk::DependencyFlags::empty(),
+                            &[vk::MemoryBarrierBuilder::new()
+                                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                            &[],
+                            &[],
+                        );
+                        device
+                            .end_command_buffer(cmd_buf)
+                            .err_retry_with_lower_memory(env, "end_command_buffer")?;
+                        device
+                            .queue_submit(queue, submit_info, fence)
+                            .err_retry_with_lower_memory(env, "queue_submit")?;
+                        device
+                            .wait_for_fences(&[fence], true, u64::MAX)
+                            .err_retry_with_lower_memory(env, "wait_for_fences")?;
+                        device
+                            .reset_fences(&[fence])
+                            .err_retry_with_lower_memory(env, "reset_fences")?;
+                        Ok(())
                     }
+                };
+                unsafe { std::ptr::write(mapped, IOBuf::for_initial_iteration()) }
+                //try to do initial memory fill to verify that allocation is really usable
+                let mut overall_exec_result = Ok(());
+                'window: for window_idx in 0..test_window_count {
+                    let test_offset = test_window_size * window_idx;
+                    // fill with WRITE_MARKER first, so values the write never reached are recognizable
+                    let skip_write =
+                        skip_write_iteration == Some(0) && window_idx == test_window_count - 1;
+                    let write_pipeline = (!skip_write).then_some(pipelines.write);
+                    if let Err(e) = execute_wait_queue(window_idx, true, write_pipeline) {
+                        overall_exec_result = Err(e);
+                        break 'window;
+                    }
+                    // reset error state per window, so each window's errors are reported once
+                    unsafe { std::ptr::write(mapped, IOBuf::for_initial_iteration()) }
+                    if let Err(e) = execute_wait_queue(window_idx, false, Some(pipelines.read)) {
+                        overall_exec_result = Err(e);
+                        break 'window;
+                    }
+                    // memory errors found by the initial fill are real errors too, don't drop them
+                    let init_buffer_out = unsafe { std::ptr::read(mapped) };
+                    init_errors_found |= report_window_errors(
+                        log_dupler,
+                        &init_buffer_out,
+                        test_offset,
+                        test_window_size,
+                        "INITIAL_READ",
+                    )
+                    .unwrap_or(true);
+                }
+                match overall_exec_result {
+                    Err(e) => last_err = e,
+                    Ok(()) => break 'memsize,
                 }
             }
         }
@@ -983,7 +1287,7 @@ fn test_device<Writer: std::io::Write>(
     {
         match unsafe {
             device.map_memory(
-                test_memory.unwrap(),
+                test_memories[0],
                 0,
                 MAP_FOR_GETTING_ADDRESS_SIZE,
                 vk::MemoryMapFlags::default(),
@@ -998,7 +1302,7 @@ fn test_device<Writer: std::io::Write>(
             }
             Ok(virt_address) => {
                 let addr_details = ram::virt_addr_details(virt_address, physical_props.device_type);
-                unsafe { device.unmap_memory(test_memory.unwrap()) }; // After getting addresses the actual mapping is not needed anymore
+                unsafe { device.unmap_memory(test_memories[0]) }; // After getting addresses the actual mapping is not needed anymore
                 if let Some(details) = addr_details {
                     writeln!(
                         log_dupler,
@@ -1039,31 +1343,42 @@ fn test_device<Writer: std::io::Write>(
     let mut buffer_in = IOBuf::for_initial_iteration();
     let first_iter_start = time::Instant::now();
     let mut last_status_output = first_iter_start;
-    let mut last_error_state = "          NO ERRORS       ".to_owned();
+    let mut last_error_state = if init_errors_found {
+        format!("LAST ERROR at {}", time::Duration::ZERO.hhmmssxxx())
+    } else {
+        "          NO ERRORS       ".to_owned()
+    };
     for iteration in 1..=iter_count {
         unsafe { std::ptr::write(mapped, buffer_in) }
         let write_start = time::Instant::now();
         for window_idx in 1..test_window_count {
-            let test_offset = test_window_size * window_idx;
             unsafe {
-                (*mapped).calc_param = buffer_in.calc_param + window_idx as u32 * 0x81_u32;
+                (*mapped).calc_param = IOBuf::calc_param_for(buffer_in.iter, window_idx);
             }
-            execute_wait_queue(
-                test_offset,
-                if iteration != emulate_write_bugs_iteration {
-                    pipelines.write
-                } else {
-                    pipelines.emulate_write_bugs
-                },
-            )?;
+            let write_pipeline = if skip_write_iteration == Some(iteration) && window_idx == 1 {
+                None // emulate a write that never reaches memory
+            } else if iteration != emulate_write_bugs_iteration {
+                Some(pipelines.write)
+            } else {
+                Some(pipelines.emulate_write_bugs)
+            };
+            execute_wait_queue(window_idx, false, write_pipeline)?;
         }
         written_bytes += test_window_size * (test_window_count - 1);
         write_duration += write_start.elapsed();
         let mut last_buffer_out: IOBuf;
         for window_idx in 0..test_window_count {
             let reread_mode_for_this_win = window_idx == 0;
-            buffer_in.set_calc_param_for_starting_window();
-            buffer_in.calc_param += window_idx as u32 * 0x81_u32;
+            buffer_in.calc_param = IOBuf::calc_param_for(buffer_in.iter, window_idx);
+            // The data this window held before this iteration's write: the initial fill
+            // (iteration 1 parameters, no window offset) or the previous iteration's write.
+            // Reading it back means this iteration's write never reached memory.
+            buffer_in.prev_calc_param = if iteration == 1 {
+                IOBuf::calc_param_for(1, 0)
+            } else {
+                IOBuf::calc_param_for(buffer_in.iter.wrapping_sub(1), window_idx)
+            };
+            buffer_in.check_stale = 1;
             unsafe {
                 std::ptr::write(
                     mapped,
@@ -1075,36 +1390,24 @@ fn test_device<Writer: std::io::Write>(
                 );
             }
             let test_offset = test_window_size * window_idx;
-            execute_wait_queue(test_offset, pipelines.read)?;
+            execute_wait_queue(window_idx, false, Some(pipelines.read))?;
             {
                 unsafe {
                     last_buffer_out = std::ptr::read(mapped);
                 }
-                if let Some((error_range, total_errors)) =
-                    last_buffer_out.get_error_addresses_and_count(test_offset)
-                {
+                if report_window_errors(
+                    log_dupler,
+                    &last_buffer_out,
+                    test_offset,
+                    test_window_size,
+                    if reread_mode_for_this_win {
+                        "NEXT_RE_READ"
+                    } else {
+                        "INITIAL_READ"
+                    },
+                )? {
                     last_error_state =
                         format!("LAST ERROR at {}", first_iter_start.elapsed().hhmmssxxx());
-                    close::raise_status_bit(close::app_status::RUNTIME_ERRORS);
-                    let test_elems = test_window_size / ELEMENT_SIZE;
-                    write!(
-                        log_dupler,
-                        "Error found. Mode {}, total errors 0x{:X} out of 0x{:X} ({:2.8}%)\nErrors address range: {:?}",
-                        if reread_mode_for_this_win {
-                            "NEXT_RE_READ"
-                        } else {
-                            "INITIAL_READ"
-                        },
-                        total_errors,
-                        test_elems,
-                        total_errors as f64 / test_elems as f64 * 100.0f64,
-                        error_range,
-                    )?;
-                    writeln!(
-                        log_dupler,
-                        "  iteration:{}\n{}",
-                        last_buffer_out.iter, last_buffer_out
-                    )?;
                 }
                 last_buffer_out.check_vec_first()?;
             }
@@ -1137,13 +1440,20 @@ fn test_device<Writer: std::io::Write>(
                 next_report_duration = extended_test_report_duration; //all later reports
             }
             if reports_before_standard_done == 0 {
-                let has_errors = close::check_any_bits_set(
-                    close::fetch_status(),
-                    close::app_status::RUNTIME_ERRORS,
-                );
-                match has_errors {
-                    true => writeln!(log_dupler, "Standard 5-minute test fail - ERRORS FOUND"),
-                    false => writeln!(
+                let status = close::fetch_status();
+                let has_errors =
+                    close::check_any_bits_set(status, close::app_status::RUNTIME_ERRORS);
+                let writes_not_applied =
+                    close::check_any_bits_set(status, close::app_status::WRITES_NOT_APPLIED);
+                match (writes_not_applied, has_errors) {
+                    (true, _) => writeln!(
+                        log_dupler,
+                        "Standard 5-minute test INVALID - test writes were not applied (most likely a driver/tool problem)"
+                    ),
+                    (false, true) => {
+                        writeln!(log_dupler, "Standard 5-minute test fail - ERRORS FOUND")
+                    }
+                    (false, false) => writeln!(
                         log_dupler,
                         "Standard 5-minute test PASSed! Just press Ctrl+C unless you plan long test run."
                     ),
@@ -1190,7 +1500,7 @@ fn test_device<Writer: std::io::Write>(
     unsafe {
         device.device_wait_idle().err_as_str()?;
 
-        free_test_mem_and_buffers(device, &mut test_buffer, &mut test_memory);
+        free_test_mem_and_buffers(device, &mut test_buffers, &mut test_memories);
 
         device.destroy_buffer(io_buffer, None);
         device.unmap_memory(io_memory);
@@ -1210,6 +1520,17 @@ struct NamedComputeDevice {
     memory_props: vk::PhysicalDeviceMemoryProperties,
     budget_props: ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXT,
     index_in_device_iteration: usize,
+    size_limits: DeviceSizeLimits,
+}
+
+/// Per-device size limits that a single test window (one allocation + one buffer) must respect.
+/// None means the limit isn't reported by the driver.
+#[derive(Clone, Copy, Default, Debug)]
+struct DeviceSizeLimits {
+    /// VkPhysicalDeviceMaintenance3Properties::maxMemoryAllocationSize (Vulkan 1.1)
+    max_memory_allocation_size: Option<i64>,
+    /// VkPhysicalDeviceMaintenance4Properties::maxBufferSize (Vulkan 1.3 / VK_KHR_maintenance4)
+    max_buffer_size: Option<i64>,
 }
 
 fn load_instance<Writer: std::io::Write>(
@@ -1417,6 +1738,24 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
                 None => return None,
             };
 
+            // Only chain extension structures the device supports: passing structures of
+            // unsupported extensions in pNext is invalid usage per the Vulkan spec.
+            let device_extensions = instance
+                .enumerate_device_extension_properties(physical_device, None, None)
+                .result()
+                .unwrap_or_default();
+            let has_extension = |name: *const std::os::raw::c_char| {
+                let wanted = CStr::from_ptr(name);
+                device_extensions
+                    .iter()
+                    .any(|ext| CStr::from_ptr(ext.extension_name.as_ptr()) == wanted)
+            };
+            let has_pci_bus_info = has_extension(ext_pci_bus_info::EXT_PCI_BUS_INFO_EXTENSION_NAME);
+            let has_memory_budget =
+                has_extension(ext_memory_budget::EXT_MEMORY_BUDGET_EXTENSION_NAME);
+            let has_maintenance4 =
+                has_extension(khr_maintenance4::KHR_MAINTENANCE_4_EXTENSION_NAME);
+
             let mut properties = instance.get_physical_device_properties(physical_device);
             let effective_version = (
                 vk::api_version_major(properties.api_version),
@@ -1429,16 +1768,39 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
             let mut budget_request =
                 ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXTBuilder::new();
 
+            let mut maintenance3_request = vk::PhysicalDeviceMaintenance3PropertiesBuilder::new();
+            let mut maintenance4_request = vk::PhysicalDeviceMaintenance4PropertiesBuilder::new();
+            // maxBufferSize: the instance is created for Vulkan 1.1, so using the 1.3 core
+            // structure is only valid when the device exposes it as VK_KHR_maintenance4
+            let query_maintenance4 = has_maintenance4;
+            let mut size_limits = DeviceSizeLimits::default();
+
             //older vulkan implementations like broadcom on RaspberryPi lacks vk_1_1 support even if application requested it
 
             let memory_props = if effective_version >= (1, 1) {
+                // maxMemoryAllocationSize is Vulkan 1.1 core
                 let mut device_props2 = vk::PhysicalDeviceProperties2Builder::new()
-                    .extend_from(&mut pci_structure_request);
+                    .extend_from(&mut maintenance3_request);
+                if has_pci_bus_info {
+                    device_props2 = device_props2.extend_from(&mut pci_structure_request);
+                }
+                if query_maintenance4 {
+                    device_props2 = device_props2.extend_from(&mut maintenance4_request);
+                }
 
                 instance.get_physical_device_properties2(physical_device, &mut device_props2);
                 properties = device_props2.properties;
-                let mut memory_props2 = vk::PhysicalDeviceMemoryProperties2Builder::new()
-                    .extend_from(&mut budget_request);
+                size_limits.max_memory_allocation_size =
+                    Some(maintenance3_request.max_memory_allocation_size as i64)
+                        .filter(|&size| size > 0);
+                if query_maintenance4 {
+                    size_limits.max_buffer_size =
+                        Some(maintenance4_request.max_buffer_size as i64).filter(|&size| size > 0);
+                }
+                let mut memory_props2 = vk::PhysicalDeviceMemoryProperties2Builder::new();
+                if has_memory_budget {
+                    memory_props2 = memory_props2.extend_from(&mut budget_request);
+                }
                 instance
                     .get_physical_device_memory_properties2(physical_device, &mut memory_props2);
                 memory_props2.memory_properties
@@ -1456,10 +1818,11 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
                 memory_props,
                 budget_props,
                 index_in_device_iteration,
+                size_limits,
             ))
         })
         .collect();
-    compute_capable_devices.sort_by_key(|(_, _, props, pci_props, _, _, _)| {
+    compute_capable_devices.sort_by_key(|(_, _, props, pci_props, _, _, _, _)| {
         // assuming that for multi-GPU scenarious the minimal PCIe bus number is used for picture output
         // and the maximal is the test target select by default "the descrete GPU with maximal PCIe bus number"
         match props.device_type {
@@ -1519,6 +1882,7 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
             memory_props,
             budget_props: d.5,
             index_in_device_iteration: d.6,
+            size_limits: d.7,
         });
     }
     Ok(LoadedDevices::new(
@@ -1917,7 +2281,18 @@ fn display_testing_outcome(test_status: TestStatus, env: &ProcessEnv) -> ! {
         //propagate closing flag to this process, so no risky-during close functions would be used
         close::raise_status_bit(close::app_status::QUIT_JOB_REQUESTED);
     }
-    if !close::check_any_bits_set(status, close::app_status::INITED_OK) {
+    if close::check_any_bits_set(status, close::app_status::WRITES_NOT_APPLIED) {
+        if env.interactive {
+            key_reader.set_pass_fail_accent_color(true);
+        }
+        println!(
+            "memtest_vulkan: test writes were NOT APPLIED, results are INVALID.\n\
+             Most likely a GPU driver or memtest_vulkan problem rather than faulty VRAM - see the log."
+        );
+        if close::check_any_bits_set(status, close::app_status::RUNTIME_ERRORS) {
+            println!("memtest_vulkan: other memory/gpu ERRORS were found as well.");
+        }
+    } else if !close::check_any_bits_set(status, close::app_status::INITED_OK) {
         println!("memtest_vulkan: INIT OR FIRST testing failed due to runtime error");
     } else if close::check_any_bits_set(status, close::app_status::RUNTIME_ABORT)
         && !close::check_any_bits_set(status, close::app_status::RUNTIME_ERRORS)
@@ -2001,4 +2376,93 @@ fn main() {
     let result = list_devices_ordered_labaled_from_1(&env, &mut log_dupler)
         .and_then(|loaded_devices| init_vk_and_check_errors(loaded_devices, &env, &mut log_dupler));
     display_result(result, &env, &mut log_dupler);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// IOBuf as the read shader leaves it after finding errors in [idx_min, idx_max]
+    fn with_errors(idx_min: u32, idx_max: u32) -> IOBuf {
+        let mut buf = IOBuf::for_initial_iteration();
+        buf.idx_min = idx_min;
+        buf.idx_max = idx_max;
+        buf.done_iter_or_err = 0xFFFF_FFFF;
+        buf
+    }
+
+    #[test]
+    fn no_errors_is_not_unwritten() {
+        assert_eq!(IOBuf::for_initial_iteration().unwritten_evidence(), None);
+    }
+
+    #[test]
+    fn block_of_marker_or_stale_values_is_unwritten() {
+        // whole 2GB window still holding the marker, as with a skipped initial write
+        let mut buf = with_errors(0, 0x1FFF_FFFF);
+        buf.mem_bitcount.0[16] = 0x2000_0000;
+        buf.unwritten_count = 0x2000_0000;
+        assert_eq!(
+            buf.unwritten_evidence(),
+            Some(UnwrittenEvidence::MarkerOrStale(0x2000_0000))
+        );
+    }
+
+    #[test]
+    fn scattered_writes_not_sticking_are_real_errors() {
+        // unstable memory where some writes don't stick leaves old data in scattered places:
+        // that's a memory fault and must not be excused as a driver problem
+        let mut buf = with_errors(0x100, 0x3BFF_FFFF);
+        buf.mem_bitcount.0[16] = 0x500;
+        buf.unwritten_count = 0x500;
+        assert_eq!(buf.unwritten_evidence(), None);
+    }
+
+    #[test]
+    fn whole_window_of_zeros_is_unwritten() {
+        // Real failure on Intel Arc B580 with a 10.5GB single buffer exceeding maxBufferSize:
+        // "Errors address range: 0xA0000000..=0xDFFFFFFF", every value read as 0x00000000
+        let mut buf = with_errors(0xA000_0000 / 4, 0xDFFF_FFFF / 4);
+        buf.mem_bitcount.0[0] = 0x1000_0000;
+        assert_eq!(
+            buf.unwritten_evidence(),
+            Some(UnwrittenEvidence::ZeroBlock(0x1000_0000))
+        );
+    }
+
+    #[test]
+    fn scattered_bit_flips_are_real_errors() {
+        // README example of real VRAM errors: few wrong values spread over a big range
+        let mut buf = with_errors(0x100, 0x3BFF_FFFF);
+        buf.mem_bitcount.0[15] = 0x1000;
+        buf.mem_bitcount.0[16] = 0x2000;
+        buf.mem_bitcount.0[0] = 3;
+        assert_eq!(buf.unwritten_evidence(), None);
+    }
+
+    #[test]
+    fn small_zero_area_is_a_real_error() {
+        let mut buf = with_errors(0x1000, 0x1000 + 0x100 - 1);
+        buf.mem_bitcount.0[0] = 0x100;
+        assert_eq!(buf.unwritten_evidence(), None);
+    }
+
+    #[test]
+    fn calc_param_matches_previous_scheme() {
+        let mut buf = IOBuf::for_initial_iteration();
+        for _ in 0..5 {
+            buf.prepare_next_iter_write();
+        }
+        buf.set_calc_param_for_starting_window();
+        assert_eq!(IOBuf::calc_param_for(buf.iter, 0), buf.calc_param);
+        assert_eq!(
+            IOBuf::calc_param_for(buf.iter, 3),
+            buf.calc_param.wrapping_add(3 * 0x81)
+        );
+        // wraps like u32 arithmetic in the shader instead of panicking
+        assert_eq!(
+            IOBuf::calc_param_for(u32::MAX, 2),
+            u32::MAX.wrapping_mul(0x100107).wrapping_add(2 * 0x81)
+        );
+    }
 }

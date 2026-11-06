@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::SeqCst};
 static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub mod app_status {
     pub const SIGNATURE: u8 = 0b01000000u8;
-    pub const SIGNATURE_MASK: u8 = 0b11100000u8;
+    pub const SIGNATURE_MASK: u8 = 0b11000000u8;
+    pub const WRITES_NOT_APPLIED: u8 = 0b100000u8; //test writes never reached memory: driver/tool problem, results invalid
     pub const INITED_OK: u8 = 0b00001u8; //init sequence complete
     pub const RUNTIME_ERRORS: u8 = 0b00010u8; //non-fatal errors were detected during runtime
     pub const RUNTIME_ABORT: u8 = 0b00100u8; //application exited in a non-expected way

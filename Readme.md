@@ -228,7 +228,9 @@ Also try running with root/admin privileges - this is sometimes required on head
 
 There are some reports that testing AMD GPUs sometimes gives unexpectedly low GPU load & video memory usage. The issue is still under investigation, but it is known that disabling/enabling "resizable BAR" in BIOS may help.
 
-Also, some drivers don't allow contiguous allocation of memory regions more than 4GB even on a GPU with a lot of memory. Such GPUs are tested with a 3.5GB memory allocation. This is not perfect, but such testing allows still allows detecting most of the errors, so don't bother if this is your case.
+Also, some drivers don't allow single memory allocations or buffers bigger than ~4GB (`maxMemoryAllocationSize`/`maxBufferSize`), even on a GPU with a lot of memory. The tested memory is split into windows of at most 3.875GB, each with its own allocation and buffer kept within the limits the driver reports, so the whole memory is still tested.
+
+If the test reports `WRITES NOT APPLIED`, it found a big contiguous block (1MB or more) of memory the test never managed to write to: it still holds the marker written before the test pattern, the data of the previous pass, or reads as all zeros. Faulty VRAM gives scattered errors instead, so this is most likely a GPU driver or memtest_vulkan problem and the results of that run are invalid. Try limiting the window size with the `MEMTEST_VULKAN_MAX_WINDOW_MB` environment variable (for example `MEMTEST_VULKAN_MAX_WINDOW_MB=512`, rounded down to 128MB steps) or another driver version. If errors disappear with smaller windows, they were caused by the driver, not the memory. If they persist everywhere, the GPU itself may be faulty.
 
 If nothing helps - enable verbose mode by renaming the executable to `memtest_vulkan_verbose` and running again. The test will output diagnostic information to stdout - please copy it to a new issue at https://github.com/GpuZelenograd/memtest_vulkan/issues.
 
@@ -253,6 +255,8 @@ If you want to experiment with code modifications, there are two ways to do this
       - and github will build the binary from your changes for you as the artifacts on the actions tab in 5 minutes!
       
 Since most of the time the GPUs are working fine, it may be hard to check the error handling behavior. The `MEMTEST_VULKAN_EMULATE_WRITE_BUG_ITERATION` environment variable was introduced to simplify this task. Set it to non-zero number generates 'fake' error during writing to the memory on the specified iteration that later would be found and reported during check stage.
+
+Similarly, `MEMTEST_VULKAN_EMULATE_SKIPPED_WRITE_ITERATION` checks the `WRITES NOT APPLIED` detection: `0` skips the initial write of the last window, a positive number skips writing window 1 on the specified iteration.
 </details>
 
 # Acknowledgements
