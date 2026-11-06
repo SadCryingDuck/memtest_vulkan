@@ -1,25 +1,39 @@
+//! Process status, exit codes and Ctrl+C / termination handling.
+
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::SeqCst};
 
 static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static INTERRUPT_COUNT: AtomicU8 = AtomicU8::new(0);
+static HANDLER_MODE: AtomicU8 = AtomicU8::new(HandlerMode::Immediate as u8);
+
+/// Status bits, also used as the exit code of the worker process, read by the console process
 pub mod app_status {
-    pub const SIGNATURE: u8 = 0b01000000u8;
-    pub const SIGNATURE_MASK: u8 = 0b11000000u8;
-    pub const WRITES_NOT_APPLIED: u8 = 0b100000u8; //test writes never reached memory: driver/tool problem, results invalid
-    pub const INITED_OK: u8 = 0b00001u8; //init sequence complete
-    pub const RUNTIME_ERRORS: u8 = 0b00010u8; //non-fatal errors were detected during runtime
-    pub const RUNTIME_ABORT: u8 = 0b00100u8; //application exited in a non-expected way
-    pub const USE_GRACEFUL_HANDLER: u8 = 0b01000u8; //application requested graceful exit handler
-    pub const QUIT_JOB_REQUESTED: u8 = 0b10000u8; //External request to quit all application jobs
+    pub const SIGNATURE: u8 = 0b0100_0000;
+    pub const SIGNATURE_MASK: u8 = 0b1100_0000;
+    pub const INITED_OK: u8 = 0b00_0001; //first test passes ran successfully
+    pub const RUNTIME_ERRORS: u8 = 0b00_0010; //memory errors were found
+    pub const RUNTIME_ABORT: u8 = 0b00_0100; //stopped by a runtime error or in an unexpected way
+    pub const COMPLETED: u8 = 0b00_1000; //the requested test duration was completed
+    pub const QUIT_JOB_REQUESTED: u8 = 0b01_0000; //console closing or termination: quit all jobs at once
+    pub const WRITES_NOT_APPLIED: u8 = 0b10_0000; //test writes never reached memory: results invalid
 }
 
-static APP_STATUS: AtomicU8 = AtomicU8::new(app_status::SIGNATURE); //1 is resettable close request, 2 is non-resettable
+/// What Ctrl+C does
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum HandlerMode {
+    /// exit at once
+    Immediate = 0,
+    /// only report the request, polled with close_requested()
+    Graceful = 1,
+    /// report the first request, exit at once on the second one
+    GracefulThenImmediate = 2,
+}
+
+static APP_STATUS: AtomicU8 = AtomicU8::new(app_status::SIGNATURE);
 
 pub fn raise_status_bit(bit: u8) {
     APP_STATUS.fetch_or(bit, SeqCst);
-}
-
-fn drop_status_bit(bit: u8) {
-    APP_STATUS.fetch_and(!bit, SeqCst);
 }
 
 pub fn fetch_status() -> u8 {
@@ -30,6 +44,7 @@ pub fn check_any_bits_set(value: u8, bits: u8) -> bool {
     (value & bits) != 0
 }
 
+/// Returns true once per Ctrl+C, or always after a request to quit all jobs
 pub fn close_requested() -> bool {
     if check_any_bits_set(fetch_status(), app_status::QUIT_JOB_REQUESTED) {
         return true;
@@ -37,25 +52,24 @@ pub fn close_requested() -> bool {
     INTERRUPT_REQUESTED.swap(false, SeqCst)
 }
 
-pub fn declare_exit_due_timeout() {
-    raise_status_bit(app_status::QUIT_JOB_REQUESTED);
-    INTERRUPT_REQUESTED.swap(true, SeqCst);
-}
-
+/// Exits with the status bits as the exit code (the worker process protocol)
 pub fn immediate_exit(raise_abort_flag: bool) -> ! {
     if raise_abort_flag {
         raise_status_bit(app_status::RUNTIME_ABORT)
     }
-    immediate_exit_with_status();
+    exit_process(APP_STATUS.load(SeqCst) as u32);
 }
 
 fn report_interrupt_request(quit_job: bool) {
-    let graceful = check_any_bits_set(fetch_status(), app_status::USE_GRACEFUL_HANDLER);
     if quit_job {
         raise_status_bit(app_status::QUIT_JOB_REQUESTED);
     }
-    if !graceful {
-        //don't raise abort - in the absence of the graceful flag - interrupt request is the excpected exit method
+    let count = INTERRUPT_COUNT.fetch_add(1, SeqCst).saturating_add(1);
+    let mode = HANDLER_MODE.load(SeqCst);
+    let exit_now = mode == HandlerMode::Immediate as u8
+        || (mode == HandlerMode::GracefulThenImmediate as u8 && (count >= 2 || quit_job));
+    if exit_now {
+        //don't raise abort - interrupt request is an expected way to stop
         immediate_exit(false)
     }
     INTERRUPT_REQUESTED.swap(true, SeqCst);
@@ -64,13 +78,11 @@ fn report_interrupt_request(quit_job: bool) {
 // This function can't gaurantee that graceful handler would not be run since it maybe already running.
 // But it would try to avoid graceful handlers
 pub fn prefer_immediate_to_graceful() {
-    drop_status_bit(app_status::USE_GRACEFUL_HANDLER)
+    HANDLER_MODE.store(HandlerMode::Immediate as u8, SeqCst);
 }
 
-pub fn setup_handler(graceful: bool) {
-    if graceful {
-        raise_status_bit(app_status::USE_GRACEFUL_HANDLER);
-    }
+pub fn setup_handler(mode: HandlerMode) {
+    HANDLER_MODE.store(mode as u8, SeqCst);
     setup_handler_impl();
 }
 
@@ -78,7 +90,7 @@ pub fn setup_handler(graceful: bool) {
 pub fn setup_handler_impl() {
     use windows_sys::Win32::System::Console;
     unsafe extern "system" fn os_handler(ctrltype: u32) -> windows_sys::core::BOOL {
-        let quit_job = ctrltype != Console::CTRL_C_EVENT;
+        let quit_job = ctrltype != Console::CTRL_C_EVENT && ctrltype != Console::CTRL_BREAK_EVENT;
         report_interrupt_request(quit_job);
         if quit_job {
             //don't return for events returning from which causes immediate termination
@@ -93,8 +105,8 @@ pub fn setup_handler_impl() {
 }
 
 #[cfg(windows)]
-fn immediate_exit_with_status() -> ! {
-    unsafe { windows_sys::Win32::System::Threading::ExitProcess(APP_STATUS.load(SeqCst) as u32) }
+pub fn exit_process(code: u32) -> ! {
+    unsafe { windows_sys::Win32::System::Threading::ExitProcess(code) }
 }
 
 #[cfg(unix)]
@@ -122,6 +134,6 @@ pub fn setup_handler_impl() {
 }
 
 #[cfg(unix)]
-fn immediate_exit_with_status() -> ! {
-    unsafe { nix::libc::_exit(APP_STATUS.load(SeqCst) as i32) }
+pub fn exit_process(code: u32) -> ! {
+    unsafe { nix::libc::_exit(code as i32) }
 }

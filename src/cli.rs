@@ -1,0 +1,337 @@
+//! Command line options.
+
+use std::{ffi::OsString, path::PathBuf, time::Duration};
+
+/// The standard test length, long enough to warm up the GPU and catch most unstable memory
+pub const STANDARD_DURATION: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TestDuration {
+    Limited(Duration),
+    Endless,
+}
+
+impl Default for TestDuration {
+    fn default() -> Self {
+        Self::Limited(STANDARD_DURATION)
+    }
+}
+
+impl TestDuration {
+    /// Value accepted back by `--duration`, used to pass it to the worker process
+    pub fn to_arg(self) -> String {
+        match self {
+            Self::Limited(duration) => format!("{}s", duration.as_secs()),
+            Self::Endless => "endless".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum LogTarget {
+    #[default]
+    Default,
+    File(PathBuf),
+    Disabled,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Options {
+    /// GPU number as shown in the list (1-based)
+    pub device: Option<usize>,
+    /// Internal: index in Vulkan device enumeration, used by the worker process
+    pub device_enumeration_index: Option<usize>,
+    /// Memory to test, in bytes
+    pub size: Option<i64>,
+    pub duration: TestDuration,
+    /// Maximum size of one test window, in megabytes
+    pub window_mb: Option<i64>,
+    pub log: LogTarget,
+    pub verbose: bool,
+    /// No prompts or key waits
+    pub batch: bool,
+    /// Only list devices
+    pub list: bool,
+    /// Internal: run the test in this process, as started by the console process
+    pub worker: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Command {
+    Run(Options),
+    Help,
+    Version,
+}
+
+pub const HELP: &str = "\
+Usage: memtest_vulkan [OPTIONS]
+
+Tests GPU video memory (VRAM) for errors using Vulkan compute shaders.
+Without options it lists the GPUs, lets you pick one (the first one is picked
+after 10 seconds), runs the standard 5-minute test and waits for a key press.
+
+Options:
+  -d, --device <N>       Test GPU number N as shown in the list (no prompt)
+  -s, --size <SIZE>      Memory to test, like 4G or 512M (default: all free VRAM)
+  -t, --duration <TIME>  How long to test, like 30s, 10m, 2h or \"endless\"
+                         (default: 5m, the standard test)
+  -w, --window-mb <MB>   Limit one test window to MB megabytes (128MB steps).
+                         If errors disappear with small windows, like 512,
+                         they come from the driver, not from the memory
+      --log <FILE>       Log file (default: memtest_vulkan.log in the current folder)
+      --no-log           Don't write a log file
+  -l, --list             List the GPUs and exit
+  -b, --batch            No prompts and no key press at the end, for scripts
+  -v, --verbose          Print diagnostic information
+  -h, --help             Show this help
+  -V, --version          Show the version
+
+Press Ctrl+C once to stop testing and show the results, twice to quit at once.
+
+Exit codes:
+  0  test passed, no errors
+  1  memory errors found
+  2  results invalid: test writes didn't reach the memory (likely a driver problem)
+  3  the test couldn't run, or stopped because of a runtime error
+  4  stopped before the test duration ended, no errors so far
+";
+
+/// Parses a memory size like `4G`, `512MB`, `1.5GiB` or plain bytes
+pub fn parse_size(text: &str) -> Result<i64, String> {
+    let lower = text.trim().to_ascii_lowercase();
+    let number_end = lower
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(lower.len());
+    let (number, unit) = lower.split_at(number_end);
+    let multiplier: f64 = match unit.trim() {
+        "" | "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => {
+            return Err(format!(
+                "unknown size unit in '{text}', use like 4G or 512M"
+            ));
+        }
+    };
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("invalid size '{text}', use like 4G or 512M"))?;
+    let bytes = value * multiplier;
+    if !(1.0..9.0e18).contains(&bytes) {
+        return Err(format!("size '{text}' is out of range"));
+    }
+    Ok(bytes as i64)
+}
+
+/// Parses a duration like `90s`, `10m`, `2h`, `endless`; a plain number means minutes
+pub fn parse_duration(text: &str) -> Result<TestDuration, String> {
+    let lower = text.trim().to_ascii_lowercase();
+    if ["endless", "infinite", "inf", "forever", "0"].contains(&lower.as_str()) {
+        return Ok(TestDuration::Endless);
+    }
+    let number_end = lower
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(lower.len());
+    let (number, unit) = lower.split_at(number_end);
+    let seconds_per_unit = match unit.trim() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
+        "" | "m" | "min" | "mins" | "minute" | "minutes" => 60.0,
+        "h" | "hour" | "hours" => 3600.0,
+        _ => {
+            return Err(format!(
+                "unknown time unit in '{text}', use like 30s, 10m or 2h"
+            ));
+        }
+    };
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("invalid duration '{text}', use like 30s, 10m or 2h"))?;
+    let seconds = value * seconds_per_unit;
+    if !(1.0..1.0e9).contains(&seconds) {
+        return Err(format!("duration '{text}' is out of range"));
+    }
+    Ok(TestDuration::Limited(Duration::from_secs_f64(seconds)))
+}
+
+/// Parses the arguments after the program name
+pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|arg| format!("argument {arg:?} isn't valid text"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Legacy form `memtest_vulkan <device> [<bytes>]` used by earlier versions for the worker
+    // process and by scripts: runs the test non-interactively without a time limit
+    if let Some(first) = args.first()
+        && let Ok(label) = first.parse::<isize>()
+    {
+        let mut options = Options {
+            worker: true,
+            duration: TestDuration::Endless,
+            ..Options::default()
+        };
+        if label > 0 {
+            options.device = Some(label as usize);
+        } else if label < 0 {
+            options.device_enumeration_index = Some((-1 - label) as usize);
+        }
+        if let Some(bytes) = args.get(1).and_then(|s| s.parse::<i64>().ok()) {
+            options.size = Some(bytes);
+        }
+        return Ok(Command::Run(options));
+    }
+
+    let mut options = Options::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let (name, inline_value) = match arg.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => {
+                (name.to_owned(), Some(value.to_owned()))
+            }
+            _ => (arg.clone(), None),
+        };
+        let mut value = |what: &str| -> Result<String, String> {
+            inline_value
+                .clone()
+                .or_else(|| iter.next())
+                .ok_or_else(|| format!("{name} needs {what}"))
+        };
+        match name.as_str() {
+            "-h" | "--help" | "/?" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
+            "-d" | "--device" => {
+                let text = value("a GPU number")?;
+                let device = text
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| {
+                        format!("invalid GPU number '{text}', use the number from the list")
+                    })?;
+                options.device = Some(device);
+            }
+            "--device-enumeration-index" => {
+                let text = value("an index")?;
+                options.device_enumeration_index = Some(
+                    text.trim()
+                        .parse()
+                        .map_err(|_| format!("invalid index '{text}'"))?,
+                );
+            }
+            "-s" | "--size" => options.size = Some(parse_size(&value("a size like 4G")?)?),
+            "-t" | "--duration" => {
+                options.duration = parse_duration(&value("a time like 10m")?)?;
+            }
+            "-w" | "--window-mb" => {
+                let text = value("a size in megabytes")?;
+                let mb = text
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|&mb| mb > 0)
+                    .ok_or_else(|| {
+                        format!("invalid window size '{text}', use megabytes like 512")
+                    })?;
+                options.window_mb = Some(mb);
+            }
+            "--log" => options.log = LogTarget::File(PathBuf::from(value("a file name")?)),
+            "--no-log" => options.log = LogTarget::Disabled,
+            "-l" | "--list" => options.list = true,
+            "-b" | "--batch" => options.batch = true,
+            "-v" | "--verbose" => options.verbose = true,
+            "--worker" => options.worker = true,
+            _ => return Err(format!("unknown option '{arg}', see --help")),
+        }
+    }
+    Ok(Command::Run(options))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(args: &[&str]) -> Options {
+        match parse(args.iter().map(OsString::from)) {
+            Ok(Command::Run(options)) => options,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defaults_to_standard_interactive_test() {
+        let options = run(&[]);
+        assert_eq!(options, Options::default());
+        assert_eq!(options.duration, TestDuration::Limited(STANDARD_DURATION));
+    }
+
+    #[test]
+    fn parses_all_options() {
+        let options = run(&[
+            "-d",
+            "2",
+            "--size=1.5G",
+            "--duration",
+            "2h",
+            "-w",
+            "512",
+            "--log",
+            "x.log",
+            "-b",
+            "-v",
+        ]);
+        assert_eq!(options.device, Some(2));
+        assert_eq!(options.size, Some(1536 * 1024 * 1024));
+        assert_eq!(
+            options.duration,
+            TestDuration::Limited(Duration::from_secs(7200))
+        );
+        assert_eq!(options.window_mb, Some(512));
+        assert_eq!(options.log, LogTarget::File("x.log".into()));
+        assert!(options.batch && options.verbose && !options.worker);
+    }
+
+    #[test]
+    fn keeps_legacy_positional_form() {
+        let options = run(&["-2", "4294967296"]);
+        assert!(options.worker);
+        assert_eq!(options.device_enumeration_index, Some(1));
+        assert_eq!(options.size, Some(4294967296));
+        assert_eq!(options.duration, TestDuration::Endless);
+        assert_eq!(run(&["3"]).device, Some(3));
+    }
+
+    #[test]
+    fn parses_sizes_and_durations() {
+        assert_eq!(parse_size("512M"), Ok(512 * 1024 * 1024));
+        assert_eq!(parse_size("4gb"), Ok(4 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size("1000"), Ok(1000));
+        assert!(parse_size("4X").is_err());
+        assert!(parse_size("").is_err());
+        assert_eq!(
+            parse_duration("90s"),
+            Ok(TestDuration::Limited(Duration::from_secs(90)))
+        );
+        assert_eq!(
+            parse_duration("10"),
+            Ok(TestDuration::Limited(Duration::from_secs(600)))
+        );
+        assert_eq!(parse_duration("endless"), Ok(TestDuration::Endless));
+        assert!(parse_duration("5 days").is_err());
+        let limited = TestDuration::Limited(Duration::from_secs(125));
+        assert_eq!(parse_duration(&limited.to_arg()), Ok(limited));
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        for args in [&["--bogus"][..], &["-d", "0"], &["-d"], &["-w", "-5"]] {
+            assert!(parse(args.iter().map(OsString::from)).is_err(), "{args:?}");
+        }
+        assert_eq!(parse([OsString::from("--help")]), Ok(Command::Help));
+    }
+}

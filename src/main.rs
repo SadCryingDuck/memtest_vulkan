@@ -1,1896 +1,95 @@
+//! memtest_vulkan: tests GPU video memory with Vulkan compute shaders.
+//!
+//! The console process lists the devices and lets the user pick one, then runs the test in a
+//! worker process (the same executable started with --worker). If the driver fails while
+//! allocating, the worker exits and the console retries with less memory.
+
+mod cli;
 mod close;
+mod devices;
 mod erupt_vendored_utils_loading;
 mod input;
+mod iobuf;
 mod output;
 mod ram;
+mod shader;
+mod tester;
+mod vk_util;
 
 pub use erupt::{CustomEntryLoader, LoaderError}; // republish for vendored part
 
-use byte_strings::c_str;
-use core::cmp::{max, min};
-use erupt::{
-    DeviceLoader, ExtendableFrom, InstanceLoader, ObjectHandle,
-    extensions::{ext_debug_utils, ext_memory_budget, ext_pci_bus_info, khr_maintenance4},
-    vk,
-};
-use erupt_vendored_utils_loading::{EntryLoader, new_loader};
-use hhmmss::Hhmmss;
+use devices::{LoadedDevices, NamedComputeDevice};
+use shader::{ALLOCATION_TRY_STEP, GB, MIN_WANTED_ALLOCATION};
 use std::{
-    env,
-    ffi::{CStr, OsString, c_void},
-    fmt,
+    ffi::OsString,
     io::Write,
-    mem,
+    path::PathBuf,
     sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, Ordering::SeqCst},
     time,
 };
 
-pub trait CmpAssign {
-    fn min_assign(&mut self, other: Self);
-    fn max_assign(&mut self, other: Self);
-}
-
-impl<T> CmpAssign for T
-where
-    T: core::cmp::Ord,
-{
-    fn min_assign(&mut self, other: Self) {
-        if &other < self {
-            *self = other;
-        }
-    }
-    fn max_assign(&mut self, other: Self) {
-        if &other > self {
-            *self = other;
-        }
-    }
-}
-
-struct CStrStaticPtr<const N: usize>([*const std::os::raw::c_char; N]);
-
-impl<const N: usize> core::ops::Deref for CStrStaticPtr<N> {
-    type Target = [*const std::os::raw::c_char; N];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-unsafe impl<const N: usize> Sync for CStrStaticPtr<N> {}
-
-const VK_LOADER_DEBUG: &str = "VK_LOADER_DEBUG";
-const LAYER_KHRONOS_VALIDATION: &CStr = c_str!("VK_LAYER_KHRONOS_validation");
-static LAYER_KHRONOS_VALIDATION_ARRAY: CStrStaticPtr<1> =
-    CStrStaticPtr([LAYER_KHRONOS_VALIDATION.as_ptr()]);
-
-// erupt CreateInfoBuilder's has problem without passing enabled_extensions argument,
-// https://github.com/GpuZelenograd/memtest_vulkan/issues/53
-// Workaround it by explicitly passing empty array
-static NO_EXTENSIONS_ARRAY: CStrStaticPtr<0> = CStrStaticPtr([]);
-
-const GB: f32 = (1024 * 1024 * 1024) as f32;
-const READ_SHADER: &[u32] = memtest_vulkan_build::compiled_vk_compute_spirv!(
-    r#"
-struct IOBuf
-{
-    err_bit1_idx: array<u32, 32>,
-    err_bitcount: array<u32, 32>,
-    mem_bitcount: array<u32, 32>,
-    actual_ff: u32,
-    actual_max: u32,
-    actual_min: u32,
-    idx_max: u32,
-    idx_min: u32,
-    done_iter_or_err: u32,
-    iter: u32,
-    calc_param: u32,
-    unwritten_count: u32,
-    prev_calc_param: u32,
-    check_stale: u32,
-    reserved: u32,
-    first_elem: vec4<u32>
-}
-
-@group(0) @binding(0) var<storage, read_write> io: IOBuf;
-@group(0) @binding(1) var<storage, read_write> test: array<vec4<u32>>;
-
-// Must match WRITE_MARKER on the CPU side: windows are filled with it before their initial write
-let WRITE_MARKER: u32 = 0xA5C396E1u;
-
-fn addr_value_by_index(i:u32, calc_param:u32)->vec4<u32>
-{
-    let effective_index_of_u32 = i * 4u + calc_param;
-    return vec4<u32>(effective_index_of_u32 + 1u, effective_index_of_u32 + 2u, effective_index_of_u32 + 3u, effective_index_of_u32 + 4u);
-}
-
-fn test_value_for_param(i:u32, calc_param:u32)->vec4<u32>
-{
-    let addrs : vec4<u32> = addr_value_by_index(i, calc_param);
-    let shifts : vec4<u32> = addrs % 31u;
-    // (32u - shifts) % 32u keeps the right shift below 32, since shifting by 32 is undefined in SPIR-V.
-    // With shifts == 0 this yields addrs | addrs == addrs, matching check_vec_first on the CPU side.
-    let rotated : vec4<u32> = (addrs << shifts) | (addrs >> ((32u - shifts) % 32u));
-    return rotated;
-}
-
-fn test_value_by_index(i:u32)->vec4<u32>
-{
-    return test_value_for_param(i, io.calc_param);
-}
-
-
-let TEST_WINDOW_1D_MAX_GROUPS: u32 = 0x4000u;
-let TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY: u32 = 0x2000u;//don't inner-multiply by window size
-
-@compute @workgroup_size(64, 1, 1)
-fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
-    let addr_mod = effective_invocation_id % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
-    let new_mod = (11 * effective_invocation_id + 999 * io.iter + io.calc_param +  7 * (effective_invocation_id / TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY)) % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
-    let effective_addr = effective_invocation_id - addr_mod + new_mod; //make read order a bit rotated, not strictly sequential
-    let actual_value : vec4<u32> = test[effective_addr];
-    let expected_value : vec4<u32> = test_value_by_index(effective_addr);
-    if any(actual_value != expected_value) {
-        //slow path, executed only on errors found
-        // what this memory held before the last write: lets us tell "write never landed" from corruption
-        let stale_value : vec4<u32> = test_value_for_param(effective_addr, io.prev_calc_param);
-        for(var i: i32 = 0; i < 4; i++) {
-            let actual_u32 = actual_value[i];
-            let error_mask = actual_u32 ^ expected_value[i];
-            if error_mask == 0 {
-                continue;
-            }
-            if actual_u32 == WRITE_MARKER || (io.check_stale != 0u && actual_u32 == stale_value[i]) {
-                atomicAdd(&io.unwritten_count, 1u);
-            }
-            let one_bits = countOneBits(error_mask);
-            if one_bits == 1
-            {
-                let bit_idx = firstLeadingBit(error_mask);
-                atomicAdd(&io.err_bit1_idx[bit_idx], 1u);
-            }
-            atomicAdd(&io.err_bitcount[one_bits % 32u], 1u);
-            let vec_addr: u32 = effective_addr * 4u + i;
-            atomicMax(&io.idx_max, vec_addr);
-            atomicMin(&io.idx_min, vec_addr);
-            atomicMax(&io.done_iter_or_err, 0xFFFFFFFFu); //ERROR_STATUS
-            let actual_bits = countOneBits(actual_u32);
-            if actual_bits == 32
-            {
-                atomicAdd(&io.actual_ff, 1u);
-            }
-            else
-            {
-                atomicAdd(&io.mem_bitcount[actual_bits], 1u);
-                atomicMax(&io.actual_max, actual_u32);
-                atomicMin(&io.actual_min, actual_u32);
-            }
-        }
-    }
-    //assign done_iter_or_err only on specific index (performance reasons)
-    if effective_addr == 0 {
-        atomicMax(&io.done_iter_or_err, io.iter);
-    } else if effective_addr == 1 {
-        io.first_elem = expected_value;
-    }
-}
-
-@compute @workgroup_size(64, 1, 1)
-fn write(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
-    //make global_invocation_id processing specific memory addr different on writing compared to reading
-    let TEST_WINDOW_SIZE_GRANULARITY: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;//don't inner-multiply by window size
-    let proccessed_mod = effective_invocation_id % TEST_WINDOW_SIZE_GRANULARITY;
-    let proccessed_idx = effective_invocation_id + TEST_WINDOW_SIZE_GRANULARITY - 2 * proccessed_mod - 1;
-    test[proccessed_idx] = test_value_by_index(proccessed_idx);
-}
-
-@compute @workgroup_size(64, 1, 1)
-fn emulate_write_bugs(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
-    let TEST_WINDOW_SIZE_GRANULARITY: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;//don't inner-multiply by window size
-    let proccessed_mod = effective_invocation_id % TEST_WINDOW_SIZE_GRANULARITY;
-    let proccessed_idx = effective_invocation_id + TEST_WINDOW_SIZE_GRANULARITY - 2 * proccessed_mod - 1;
-    test[proccessed_idx] = test_value_by_index(proccessed_idx);
-    if proccessed_idx == 0xADBA {
-        test[proccessed_idx][1] ^= 0x400000u;//error simulation for test
-    }
-}
-"#
-);
-
-const WG_SIZE: i64 = 64;
-const VEC_SIZE: usize = 4; //vector processed by single workgroup item
-const ELEMENT_SIZE: i64 = std::mem::size_of::<u32>() as i64;
-const ELEMENT_BIT_SIZE: usize = (ELEMENT_SIZE * 8) as usize;
-const TEST_WINDOW_1D_MAX_GROUPS: i64 = 0x4000;
-const TEST_WINDOW_SIZE_GRANULARITY: i64 =
-    VEC_SIZE as i64 * WG_SIZE * ELEMENT_SIZE * TEST_WINDOW_1D_MAX_GROUPS * 8_i64;
-const TEST_WINDOW_MAX_SIZE: i64 = 4 * 1024 * 1024 * 1024 - TEST_WINDOW_SIZE_GRANULARITY;
-const TEST_DATA_KEEP_FREE: i64 = 400 * 1024 * 1024;
-const MIN_WANTED_ALLOCATION: i64 = TEST_DATA_KEEP_FREE;
-const ALLOCATION_TRY_STEP: i64 = TEST_DATA_KEEP_FREE;
-
-const MAP_FOR_GETTING_ADDRESS_SIZE: u64 = 2 * 1024 * 1024; // signle huge page
-
-/// Environment variable limiting a single test window size, in megabytes (rounded down to 128MB steps)
-const MAX_WINDOW_MB_ENV: &str = "MEMTEST_VULKAN_MAX_WINDOW_MB";
-/// Environment variable skipping one write pass, to check the "writes not applied" detection:
-/// 0 skips the initial write of the last window, N>0 skips writing window 1 on iteration N
-const EMULATE_SKIPPED_WRITE_ENV: &str = "MEMTEST_VULKAN_EMULATE_SKIPPED_WRITE_ITERATION";
-
-/// Value every test window is filled with before its first write. The test pattern practically
-/// never equals it, so reading it back means the write never reached memory. Must match the shader.
-const WRITE_MARKER: u32 = 0xA5C3_96E1;
-/// A contiguous block of at least this many u32 values that all read back as the marker,
-/// the previous pass's data or exactly zero (the way out-of-bounds access behaves) is treated
-/// as never written rather than as faulty VRAM, which gives scattered errors instead.
-/// 0x40000 values = 1MB.
-const UNWRITTEN_BLOCK_MIN_WORDS: i64 = 0x40000;
-
-struct ComputePipelines {
-    read: vk::Pipeline,
-    #[allow(dead_code)]
-    write: vk::Pipeline,
-    #[allow(dead_code)]
-    emulate_write_bugs: vk::Pipeline,
-}
-#[derive(Default)]
-struct U64HexDebug(i64);
-
-impl fmt::Debug for U64HexDebug {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "0x{:X}", self.0)
-    }
+/// Exit codes of the console process, documented in --help
+mod exit_code {
+    pub const PASSED: u32 = 0;
+    pub const ERRORS_FOUND: u32 = 1;
+    pub const WRITES_NOT_APPLIED: u32 = 2;
+    pub const NOT_RUN: u32 = 3;
+    pub const INCOMPLETE: u32 = 4;
 }
 
 #[derive(Default)]
-struct DriverVersionDebug(u32);
+pub struct ProcessEnv {
+    argv0: Option<OsString>,
+    device_label: AtomicIsize, //0 = autoselect, >0 index as displayed&sorted by memtest_vulkan, <0 -index as reported by device enumeration
+    max_test_bytes: AtomicI64,
+    verbose_requested: AtomicBool,
+    /// This is the console process: shows the devices and runs the test in a worker process
+    pub interactive: bool,
+    pub options: cli::Options,
+    /// Absolute path of the log file, if logging
+    pub log_path: Option<PathBuf>,
+}
 
-impl fmt::Debug for DriverVersionDebug {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let upper10bits = self.0 >> 22;
-        if upper10bits > 2 {
-            // NVIDIA (0x75a04180 = 470.129.06) and intel-mesa-on-linux (0x5402006 = 21.2.6) driver versioning
-            return write!(f, "v{}(0x{:X})", upper10bits, self.0);
-        }
-        let upper18bits = self.0 >> 14;
-        if upper18bits > 2 && upper18bits < 500 {
-            //intel-on-windows driver versioning (0x19453c = [30.0.]101.1340)
-            return write!(f, "v{}(0x{:X})", upper18bits, self.0);
-        }
-        if self.0 < 64 {
-            //basic small number versioning like llvm
-            return write!(f, "ver{}", self.0);
-        }
-        // don't parse AMD versioning like "0x8000E6"
-        write!(f, "0x{:X}", self.0)
+impl ProcessEnv {
+    fn effective_index_in_loaded_devices(&self) -> usize {
+        // converts internal represntation to always-nonnegative index
+        // 0 or nagative value means that selection is done at the moment of filling loaded_devices
+        // so report selected index if positive and 0 otherwise
+        (self.device_label.load(SeqCst) - 1).try_into().unwrap_or(0)
     }
-}
 
-#[derive(Copy, Clone)]
-struct MostlyZeroArr<const LEN: usize>([u32; LEN]);
-
-impl<const LEN: usize> fmt::Display for MostlyZeroArr<LEN> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if LEN < 8 {
-            for i in 0..LEN {
-                write!(f, "0x{:08X} ", self.0[i])?;
-            }
-            return Ok(());
-        }
-        for i in 0..LEN {
-            let next_row = i / 16;
-            if next_row > 0
-                && self.0[next_row * 16..next_row * 16 + 16]
-                    .iter()
-                    .all(|v| v == &0u32)
-            {
-                continue; //skip entire line of zeroes
-            }
-            if i % 16 == 0 && i != 0 {
-                write!(f, "   0x{:X}? ", i / 16)?;
-            }
-            let vali = self.0[i];
-            if vali > 999999u32 {
-                write!(f, "{:3}m", vali / 1000000u32)?;
-            } else if vali > 9999u32 {
-                write!(f, "{:3}k", vali / 1000u32)?;
-            } else if vali > 0 {
-                write!(f, "{:4}", vali)?;
-            } else {
-                write!(f, "    ")?; //zero
-            }
-            if i % 16 == 15 {
-                writeln!(f)?;
-            } else if i % 4 == 3 {
-                write!(f, "|")?;
-            } else if i % 4 == 1 {
-                write!(f, " ")?;
-            }
-        }
-        Ok(())
+    pub fn requested_index_in_device_iteration(&self) -> Option<usize> {
+        // convert negative value to an index, zero or positive values convert to None
+        (-1 - self.device_label.load(SeqCst)).try_into().ok()
     }
-}
 
-impl<const LEN: usize> std::default::Default for MostlyZeroArr<LEN> {
-    fn default() -> Self {
-        Self([0; LEN])
+    pub fn verbose(&self) -> bool {
+        self.verbose_requested.load(SeqCst)
     }
-}
 
-#[derive(Copy, Clone, Default)]
-#[repr(C)]
-struct IOBuf {
-    err_bit1_idx: MostlyZeroArr<ELEMENT_BIT_SIZE>,
-    err_bitcount: MostlyZeroArr<ELEMENT_BIT_SIZE>,
-    mem_bitcount: MostlyZeroArr<ELEMENT_BIT_SIZE>,
-    actual_ff: u32,
-    actual_max: u32,
-    actual_min: u32,
-    idx_max: u32,
-    idx_min: u32,
-    done_iter_or_err: u32,
-    iter: u32,
-    calc_param: u32,
-    /// wrong values that look like the write never reached memory (marker or previous pass data)
-    unwritten_count: u32,
-    /// calc_param of the data held in this window before the last write
-    prev_calc_param: u32,
-    /// nonzero if the window was rewritten since the previous pass, so prev_calc_param data is stale
-    check_stale: u32,
-    reserved: u32, // keeps first_elem 16-byte aligned like vec4 in WGSL
-    first_elem: MostlyZeroArr<VEC_SIZE>,
-}
+    fn make_verbose(&self) {
+        self.verbose_requested.store(true, SeqCst)
+    }
 
-// IOBuf must have the same layout as the WGSL struct: 3*32 + 12 u32 fields + vec4
-const _: () = assert!(mem::size_of::<IOBuf>() == (3 * 32 + 12 + 4) * 4);
+    pub fn max_test_bytes(&self) -> i64 {
+        self.max_test_bytes.load(SeqCst)
+    }
 
-/// Why a window's wrong values look like writes that never reached memory
-#[derive(Debug, PartialEq)]
-enum UnwrittenEvidence {
-    /// values still hold the pre-write marker or the data of the previous pass
-    MarkerOrStale(i64),
-    /// a big contiguous block reads entirely as zero
-    ZeroBlock(i64),
-}
+    fn mem_budget_estimated(&self) -> bool {
+        self.max_test_bytes() > 0
+    }
 
-impl fmt::Display for IOBuf {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.actual_min <= self.actual_max {
-            write!(
-                f,
-                "values range: 0x{:08X}..=0x{:08X}",
-                self.actual_min, self.actual_max
-            )?;
+    fn set_mem_budget_limit(&self, new_limit: i64) {
+        if self.mem_budget_estimated() {
+            self.max_test_bytes.fetch_min(new_limit, SeqCst);
         } else {
-            // only FFFFFFFF-like wrong values were seen, so min/max were never updated
-            write!(f, "values range: none (only FFFFFFFF-like)")?;
-        }
-        writeln!(
-            f,
-            "   FFFFFFFF-like count:{}    bit-level stats table:",
-            self.actual_ff
-        )?;
-        writeln!(
-            f,
-            "         0x0 0x1  0x2 0x3| 0x4 0x5  0x6 0x7| 0x8 0x9  0xA 0xB| 0xC 0xD  0xE 0xF"
-        )?;
-        write!(f, "SinglIdx{}", self.err_bit1_idx)?;
-        write!(f, "TogglCnt{}", self.err_bitcount)?;
-        write!(f, "1sInValu{}", self.mem_bitcount)?;
-        Ok(())
-    }
-}
-
-impl IOBuf {
-    fn for_initial_iteration() -> Self {
-        let mut result = Self::default();
-        result.prepare_next_iter_write();
-        result
-    }
-    fn prepare_next_iter_write(&mut self) {
-        self.reset_errors();
-        self.iter += 1;
-        self.set_calc_param_for_starting_window();
-    }
-    fn set_calc_param_for_starting_window(&mut self) {
-        self.calc_param = Self::calc_param_for(self.iter, 0);
-    }
-    /// calc_param used to write window `window_idx` on iteration `iter` of the main loop
-    fn calc_param_for(iter: u32, window_idx: i64) -> u32 {
-        iter.wrapping_mul(0x100107)
-            .wrapping_add(window_idx as u32 * 0x81_u32)
-    }
-    /// Recognizes errors caused by writes that never reached memory - typically a driver or
-    /// tool problem. Only a big contiguous block counts: real memory faults (including unstable
-    /// memory where single writes don't stick) give scattered errors instead, so these
-    /// must stay reported as memory errors.
-    fn unwritten_evidence(&self) -> Option<UnwrittenEvidence> {
-        if self.idx_min > self.idx_max {
-            return None; // no errors recorded
-        }
-        let range_words = self.idx_max as i64 - self.idx_min as i64 + 1;
-        // practically every value in the error range is affected
-        // (allowing a few values whose expected pattern equals the read one, so aren't errors)
-        let is_contiguous_block = |words: i64| {
-            range_words >= UNWRITTEN_BLOCK_MIN_WORDS && words * 1000 >= range_words * 999
-        };
-        let unwritten_words = self.unwritten_count as i64;
-        if is_contiguous_block(unwritten_words) {
-            return Some(UnwrittenEvidence::MarkerOrStale(unwritten_words));
-        }
-        let zero_words = self.mem_bitcount.0[0] as i64; // values with no bits set
-        if is_contiguous_block(zero_words) {
-            return Some(UnwrittenEvidence::ZeroBlock(zero_words));
-        }
-        None
-    }
-    fn reset_errors(&mut self) {
-        *self = IOBuf {
-            iter: self.iter,
-            calc_param: self.calc_param,
-            prev_calc_param: self.prev_calc_param,
-            check_stale: self.check_stale,
-            idx_max: u32::MIN,
-            idx_min: u32::MAX,
-            actual_max: u32::MIN,
-            actual_min: u32::MAX,
-            ..Self::default()
-        };
-    }
-    fn get_error_addresses_and_count(
-        &self,
-        buf_offset: i64,
-    ) -> Option<(std::ops::RangeInclusive<U64HexDebug>, i64)> {
-        if self.done_iter_or_err == self.iter {
-            None
-        } else {
-            // wrong values reading as FFFFFFFF are counted only in actual_ff, not in mem_bitcount
-            let total_errors =
-                self.mem_bitcount.0.iter().map(|&v| v as i64).sum::<i64>() + self.actual_ff as i64;
-            Some((
-                std::ops::RangeInclusive::<U64HexDebug>::new(
-                    U64HexDebug(buf_offset + self.idx_min as i64 * ELEMENT_SIZE),
-                    U64HexDebug(buf_offset + (self.idx_max as i64 + 1) * ELEMENT_SIZE - 1),
-                ),
-                total_errors,
-            ))
-        }
-    }
-    #[allow(clippy::manual_rotate)] // this is kept as similar to WGSL shader above as possible
-    fn check_vec_first(&self) -> Result<(), Box<dyn std::error::Error>> {
-        const TEST_IDX: u32 = 1;
-        // wrapping like u32 arithmetic in the shader (avoids overflow panics in debug builds)
-        let addr: u32 = self
-            .calc_param
-            .wrapping_add(TEST_IDX * VEC_SIZE as u32 + 1u32);
-        let shift = addr % 31u32;
-        let rotated = if shift > 0 {
-            addr << shift | addr >> (32 - shift)
-        } else {
-            addr
-        };
-        if rotated != self.first_elem.0[0] {
-            println!("{} 0x{:08X}", self, rotated);
-            return Err("unexpected calculated value, maybe shader execution is broken".into());
-        }
-        Ok(())
-    }
-}
-
-trait MapErrStr {
-    type ValueType;
-    fn err_as_str(self) -> Result<Self::ValueType, Box<dyn std::error::Error>>;
-    fn err_as_str_context(
-        self,
-        context: &str,
-    ) -> Result<Self::ValueType, Box<dyn std::error::Error>>;
-    fn unwrap_or_display(self, env: &ProcessEnv) -> Self::ValueType
-    where
-        Self: Sized,
-    {
-        match self.err_as_str() {
-            Err(e) => display_this_process_result(Some(e), env),
-            Ok(v) => v,
-        }
-    }
-}
-
-trait MapErrRetryWithLowerMemory {
-    type ValueType;
-    fn err_retry_with_lower_memory(
-        self,
-        env: &ProcessEnv,
-        context: &str,
-    ) -> Result<Self::ValueType, Box<dyn std::error::Error>>;
-}
-
-impl<T> MapErrStr for std::result::Result<T, erupt::LoaderError> {
-    type ValueType = T;
-    fn err_as_str(self) -> Result<Self::ValueType, Box<dyn std::error::Error>> {
-        self.map_err(|res| {
-            let msg = match res {
-                erupt::LoaderError::SymbolNotAvailable => {
-                    "SymbolNotAvailable in Loader".to_string()
-                }
-                erupt::LoaderError::VulkanError(result) => format!("{}", result),
-            } + " while getting "
-                + std::any::type_name::<Self::ValueType>();
-            msg.into()
-        })
-    }
-    fn err_as_str_context(
-        self,
-        context: &str,
-    ) -> Result<Self::ValueType, Box<dyn std::error::Error>> {
-        self.map_err(|res| {
-            let msg = match res {
-                erupt::LoaderError::SymbolNotAvailable => {
-                    "SymbolNotAvailable in Loader".to_string()
-                }
-                erupt::LoaderError::VulkanError(result) => format!("{}", result),
-            } + " while getting "
-                + std::any::type_name::<Self::ValueType>()
-                + " in context "
-                + context;
-            msg.into()
-        })
-    }
-}
-
-impl<T> MapErrStr for erupt::utils::VulkanResult<T> {
-    type ValueType = T;
-    fn err_as_str(self) -> Result<Self::ValueType, Box<dyn std::error::Error>> {
-        let result = self.result();
-        result.map_err(|res| {
-            let msg =
-                res.to_string() + " while getting " + std::any::type_name::<Self::ValueType>();
-            msg.into()
-        })
-    }
-    fn err_as_str_context(
-        self,
-        context: &str,
-    ) -> Result<Self::ValueType, Box<dyn std::error::Error>> {
-        let result = self.result();
-        result.map_err(|res| {
-            let msg = res.to_string()
-                + " while getting "
-                + std::any::type_name::<Self::ValueType>()
-                + " in context "
-                + context;
-            msg.into()
-        })
-    }
-}
-impl<T> MapErrRetryWithLowerMemory for erupt::utils::VulkanResult<T> {
-    type ValueType = T;
-    fn err_retry_with_lower_memory(
-        self,
-        env: &ProcessEnv,
-        context: &str,
-    ) -> Result<Self::ValueType, Box<dyn std::error::Error>> {
-        let result = self.result();
-        result.map_err(|res| {
-            let msg = res.to_string()
-                + " while getting "
-                + std::any::type_name::<Self::ValueType>()
-                + " in context "
-                + context;
-            if !env.interactive
-                && !close::check_any_bits_set(close::fetch_status(), close::app_status::INITED_OK)
-            {
-                let out_of_memory = matches!(
-                    res,
-                    vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY
-                );
-                // Running out of memory is expected while searching for the testable size.
-                // Other errors (like ERROR_DEVICE_LOST after a GPU hang/driver reset) may indicate
-                // instability, so always show them instead of retrying silently.
-                if env.verbose() || !out_of_memory {
-                    println!("Retrying with lower memory due to {}", msg);
-                }
-                //immediate exit in non-interactive during init to initiate try with lower memory
-                close::immediate_exit(true);
-            }
-            msg.into()
-        })
-    }
-}
-
-unsafe extern "system" fn debug_callback(
-    _message_severity: vk::DebugUtilsMessageSeverityFlagBitsEXT,
-    _message_types: vk::DebugUtilsMessageTypeFlagsEXT,
-    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-    _p_user_data: *mut c_void,
-) -> vk::Bool32 {
-    let cstr_message = unsafe { CStr::from_ptr((*p_callback_data).p_message) };
-
-    eprintln!("{}", cstr_message.to_string_lossy());
-    vk::FALSE
-}
-fn memory_requirements(
-    device: &erupt::DeviceLoader,
-    min_wanted_allocation: i64,
-) -> Result<(vk::MemoryRequirements, vk::BufferCreateInfoBuilder<'_>), Box<dyn std::error::Error>> {
-    let test_buffer_create_info = vk::BufferCreateInfoBuilder::new()
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        // TRANSFER_DST: windows are filled with WRITE_MARKER before their first write
-        .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-        .size(min_wanted_allocation as u64);
-    let test_buffer =
-        unsafe { device.create_buffer(&test_buffer_create_info, None) }.err_as_str()?;
-    let test_mem_reqs = unsafe { device.get_buffer_memory_requirements(test_buffer) };
-    unsafe { device.destroy_buffer(test_buffer, None) }; //buffer was used for getting memory reuirements. After allocation size may be smaller
-    Ok((test_mem_reqs, test_buffer_create_info))
-}
-
-fn free_test_mem_and_buffers(
-    device: &erupt::DeviceLoader,
-    buffers: &mut Vec<vk::Buffer>,
-    memories: &mut Vec<vk::DeviceMemory>,
-) {
-    for some_buffer in buffers.drain(..) {
-        unsafe {
-            device.destroy_buffer(some_buffer, None);
-        }
-    }
-    for some_memory in memories.drain(..) {
-        unsafe {
-            device.free_memory(some_memory, None);
-        }
-    }
-}
-
-/// Allocates a separate memory block and buffer for every test window.
-/// A single huge allocation/buffer would exceed maxMemoryAllocationSize/maxBufferSize on drivers
-/// limiting them to ~4GB (like Intel Arc), which silently drops part of the writes and makes
-/// untouched (zero) memory look like memory errors.
-#[allow(clippy::too_many_arguments)]
-fn allocate_test_windows(
-    device: &erupt::DeviceLoader,
-    env: &ProcessEnv,
-    test_buffer_create_info: vk::BufferCreateInfoBuilder<'_>,
-    test_mem_index: u32,
-    test_window_size: i64,
-    test_window_count: i64,
-    buffers: &mut Vec<vk::Buffer>,
-    memories: &mut Vec<vk::DeviceMemory>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for _ in 0..test_window_count {
-        let buffer = unsafe {
-            device.create_buffer(&test_buffer_create_info.size(test_window_size as u64), None)
-        }
-        .err_retry_with_lower_memory(env, "create_buffer")?;
-        buffers.push(buffer);
-        let buffer_reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let allocate_info = vk::MemoryAllocateInfoBuilder::new()
-            .allocation_size(buffer_reqs.size)
-            .memory_type_index(test_mem_index);
-        let memory = unsafe { device.allocate_memory(&allocate_info, None) }
-            .err_retry_with_lower_memory(env, "allocate_memory")?;
-        memories.push(memory);
-        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
-            .err_retry_with_lower_memory(env, "bind_buffer_memory")?;
-    }
-    Ok(())
-}
-fn try_fill_default_mem_budget<Writer: std::io::Write>(
-    selected_device: &NamedComputeDevice,
-    env: &ProcessEnv,
-    log_dupler: &mut output::LogDupler<Writer>,
-) {
-    if env.verbose() {
-        let _ = writeln!(log_dupler, "Loading memory info for selected device...",);
-    }
-
-    if env.mem_budget_estimated() {
-        //don't estimate budget if it is already specified
-        return;
-    }
-
-    let mut max_budget = 0;
-    for i in 0..selected_device.memory_props.memory_heap_count as usize {
-        if env.verbose() {
-            let _ = writeln!(
-                log_dupler,
-                "heap size {:4.1}GB budget {:4.1}GB usage {:4.1}GB flags={:#?}",
-                selected_device.memory_props.memory_heaps[i].size as f32 / GB,
-                selected_device.budget_props.heap_budget[i] as f32 / GB,
-                selected_device.budget_props.heap_usage[i] as f32 / GB,
-                selected_device.memory_props.memory_heaps[i].flags,
-            );
-        }
-        if !selected_device.memory_props.memory_heaps[i]
-            .flags
-            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-        {
-            continue;
-        }
-        let mut heap_free = selected_device.memory_props.memory_heaps[i].size as i64;
-        let usage = selected_device.budget_props.heap_usage[i] as i64;
-        if usage > 0 && usage < heap_free {
-            heap_free -= usage;
-        }
-        let budget = selected_device.budget_props.heap_budget[i] as i64;
-        if budget > 0 {
-            heap_free = min(heap_free, budget);
-        }
-        if selected_device.physical_props.device_type != vk::PhysicalDeviceType::DISCRETE_GPU {
-            // for non-descrete GPUs consult the system free memory
-            if let Some(ram_budget) = ram::budget() {
-                heap_free = min(heap_free, ram_budget as i64);
-            }
-        }
-        max_budget.max_assign(heap_free - TEST_DATA_KEEP_FREE);
-    }
-    env.set_mem_budget_limit(max_budget);
-}
-
-fn prepare_and_test_device<Writer: std::io::Write>(
-    instance: &erupt::InstanceLoader,
-    selected: &NamedComputeDevice,
-    env: &ProcessEnv,
-    log_dupler: &mut output::LogDupler<Writer>,
-) -> ! {
-    let queue_create_info = vec![
-        vk::DeviceQueueCreateInfoBuilder::new()
-            .queue_family_index(selected.queue_family_index)
-            .queue_priorities(&[1.0]),
-    ];
-
-    let device_create_info = vk::DeviceCreateInfoBuilder::new()
-        .enabled_extension_names(&*NO_EXTENSIONS_ARRAY)
-        .queue_create_infos(&queue_create_info);
-
-    let device =
-        match unsafe { DeviceLoader::new(instance, selected.physical_device, &device_create_info) }
-        {
-            Ok(device) => device,
-            Err(e) => display_this_process_result(Some(e.into()), env),
-        };
-    let queue = unsafe { device.get_device_queue(selected.queue_family_index, 0) };
-
-    let cmd_pool_info = vk::CommandPoolCreateInfoBuilder::new()
-        .queue_family_index(selected.queue_family_index)
-        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-    let cmd_pool =
-        unsafe { device.create_command_pool(&cmd_pool_info, None) }.unwrap_or_display(env);
-
-    let cmd_buf_info = vk::CommandBufferAllocateInfoBuilder::new()
-        .command_pool(cmd_pool)
-        .command_buffer_count(1)
-        .level(vk::CommandBufferLevel::PRIMARY);
-    let cmd_bufs = unsafe { device.allocate_command_buffers(&cmd_buf_info) }.unwrap_or_display(env);
-
-    let desc_pool_sizes = &[vk::DescriptorPoolSizeBuilder::new()
-        .descriptor_count(2)
-        ._type(vk::DescriptorType::STORAGE_BUFFER)];
-    let desc_pool_info = vk::DescriptorPoolCreateInfoBuilder::new()
-        .pool_sizes(desc_pool_sizes)
-        .max_sets(1);
-    let desc_pool =
-        unsafe { device.create_descriptor_pool(&desc_pool_info, None) }.unwrap_or_display(env);
-
-    let desc_layout_bindings = &[
-        vk::DescriptorSetLayoutBindingBuilder::new()
-            .binding(0)
-            .descriptor_count(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        vk::DescriptorSetLayoutBindingBuilder::new()
-            .binding(1)
-            .descriptor_count(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-    ];
-    let desc_layout_info =
-        vk::DescriptorSetLayoutCreateInfoBuilder::new().bindings(desc_layout_bindings);
-    let desc_layouts = [
-        unsafe { device.create_descriptor_set_layout(&desc_layout_info, None) }
-            .unwrap_or_display(env),
-    ];
-
-    let desc_info = vk::DescriptorSetAllocateInfoBuilder::new()
-        .descriptor_pool(desc_pool)
-        .set_layouts(&desc_layouts);
-    let desc_sets = unsafe { device.allocate_descriptor_sets(&desc_info) }.unwrap_or_display(env);
-
-    let pipeline_layout_info =
-        vk::PipelineLayoutCreateInfoBuilder::new().set_layouts(&desc_layouts);
-    let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) }
-        .unwrap_or_display(env);
-
-    let spv_code = Vec::from(READ_SHADER);
-    let create_info = vk::ShaderModuleCreateInfoBuilder::new().code(&spv_code);
-    let shader_mod =
-        unsafe { device.create_shader_module(&create_info, None) }.unwrap_or_display(env);
-
-    let pipeline_infos = [
-        c_str!("read"),
-        c_str!("write"),
-        c_str!("emulate_write_bugs"),
-    ]
-    .map(|name| {
-        let shader_stage = vk::PipelineShaderStageCreateInfoBuilder::new()
-            .stage(vk::ShaderStageFlagBits::COMPUTE)
-            .module(shader_mod)
-            .name(name);
-        vk::ComputePipelineCreateInfoBuilder::new()
-            .layout(pipeline_layout)
-            .stage(*shader_stage)
-    });
-
-    let pipelines =
-        unsafe { device.create_compute_pipelines(Default::default(), &pipeline_infos, None) }
-            .unwrap_or_display(env);
-    let pipelines = ComputePipelines {
-        read: pipelines[0],
-        write: pipelines[1],
-        emulate_write_bugs: pipelines[2],
-    };
-
-    if let Err(e) = test_device(
-        &device,
-        queue,
-        cmd_bufs,
-        desc_sets,
-        &pipeline_layout,
-        &pipelines,
-        log_dupler,
-        selected,
-        env,
-    ) {
-        display_this_process_result(Some(e), env)
-    }
-    display_this_process_result(None, env)
-}
-
-/// Logs the errors found by a read pass over one test window.
-/// Returns true (and raises the RUNTIME_ERRORS status bit) if there were any.
-fn report_window_errors<Writer: std::io::Write>(
-    log_dupler: &mut output::LogDupler<Writer>,
-    buffer_out: &IOBuf,
-    test_offset: i64,
-    test_window_size: i64,
-    mode: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let Some((error_range, total_errors)) = buffer_out.get_error_addresses_and_count(test_offset)
-    else {
-        return Ok(false);
-    };
-    let unwritten = buffer_out.unwritten_evidence();
-    let unwritten_words = match unwritten {
-        Some(UnwrittenEvidence::MarkerOrStale(count) | UnwrittenEvidence::ZeroBlock(count)) => {
-            count
-        }
-        None => 0,
-    };
-    if unwritten.is_some() {
-        close::raise_status_bit(close::app_status::WRITES_NOT_APPLIED);
-    }
-    if total_errors > unwritten_words {
-        // wrong values that can't be explained by missing writes
-        close::raise_status_bit(close::app_status::RUNTIME_ERRORS);
-    }
-    let test_elems = test_window_size / ELEMENT_SIZE;
-    write!(
-        log_dupler,
-        "Error found. Mode {}, total errors 0x{:X} out of 0x{:X} ({:2.8}%)\nErrors address range: {:?}",
-        mode,
-        total_errors,
-        test_elems,
-        total_errors as f64 / test_elems as f64 * 100.0f64,
-        error_range,
-    )?;
-    writeln!(
-        log_dupler,
-        "  iteration:{}\n{}",
-        buffer_out.iter, buffer_out
-    )?;
-    if let Some(evidence) = unwritten {
-        let reason = match evidence {
-            UnwrittenEvidence::MarkerOrStale(_) => {
-                "still hold the pre-write marker or the previous pass's data"
-            }
-            UnwrittenEvidence::ZeroBlock(_) => "form one contiguous block reading exactly zero",
-        };
-        writeln!(
-            log_dupler,
-            "WRITES NOT APPLIED: 0x{unwritten_words:X} of these wrong values {reason}.\n\
-             The test's writes never reached this memory. This is most likely a GPU driver or memtest_vulkan\n\
-             problem rather than faulty VRAM. Retry with {MAX_WINDOW_MB_ENV}=512 or another driver version;\n\
-             if it persists, the GPU itself may be faulty.",
-        )?;
-    }
-    Ok(true)
-}
-
-fn test_device<Writer: std::io::Write>(
-    device: &erupt::DeviceLoader,
-    queue: vk::Queue,
-    cmd_bufs: erupt::SmallVec<vk::CommandBuffer>,
-    desc_sets: erupt::SmallVec<vk::DescriptorSet>,
-    pipeline_layout: &vk::PipelineLayout,
-    pipelines: &ComputePipelines,
-    log_dupler: &mut output::LogDupler<Writer>,
-    selected: &NamedComputeDevice,
-    env: &ProcessEnv,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let selected_label = &selected.label;
-    let memory_props = selected.memory_props;
-    let physical_props = selected.physical_props;
-    let mut allocation_size = env.max_test_bytes.load(SeqCst);
-    if allocation_size < MIN_WANTED_ALLOCATION {
-        return Err("requested test size is smaller than minimum wanted".into());
-    }
-    // allow emulating writes that never reach memory, for testing the detection of it
-    let skip_write_iteration = env::var(EMULATE_SKIPPED_WRITE_ENV)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok());
-
-    let io_data_size = mem::size_of::<IOBuf>() as vk::DeviceSize;
-
-    let io_buffer_create_info = vk::BufferCreateInfoBuilder::new()
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-        .size(io_data_size);
-    let io_buffer = unsafe { device.create_buffer(&io_buffer_create_info, None) }.err_as_str()?;
-    let io_mem_reqs = unsafe { device.get_buffer_memory_requirements(io_buffer) };
-    let mut io_mem_indices = Vec::new();
-    for i in 0..memory_props.memory_type_count {
-        //test buffer comptibility flags expressed as bitmask
-        let suitable = (io_mem_reqs.memory_type_bits & (1 << i)) != 0;
-        let memory_type = memory_props.memory_types[i as usize];
-        if env.verbose() && !memory_type.property_flags.is_empty() {
-            let _ = writeln!(log_dupler, "{:2} {:?} ", i, memory_type);
-        }
-        if suitable
-            && memory_type.property_flags.contains(
-                vk::MemoryPropertyFlags::DEVICE_LOCAL
-                    | vk::MemoryPropertyFlags::HOST_VISIBLE
-                    | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-        {
-            io_mem_indices.push(i);
+            self.max_test_bytes.store(new_limit, SeqCst);
         }
     }
 
-    // sorting by a flag value allows selection of index with the minimum count of new unknown flags
-    let io_mem_index = io_mem_indices
-        .into_iter()
-        .min_by_key(|i| memory_props.memory_types[*i as usize].property_flags)
-        .ok_or("This device lacks support for DEVICE_LOCAL+HOST_COHERENT memory type.")?;
-    if env.verbose() {
-        let _ = writeln!(
-            log_dupler,
-            "CoherentIO memory          type {} inside heap {:?}",
-            io_mem_index,
-            memory_props.memory_heaps
-                [memory_props.memory_types[io_mem_index as usize].heap_index as usize]
-        );
+    fn wait_for_key(&self) -> bool {
+        self.interactive && !self.options.batch
     }
-
-    let io_memory_allocate_info = vk::MemoryAllocateInfoBuilder::new()
-        .allocation_size(io_mem_reqs.size)
-        .memory_type_index(io_mem_index);
-    let io_memory =
-        unsafe { device.allocate_memory(&io_memory_allocate_info, None) }.err_as_str()?;
-
-    let mapped: *mut IOBuf =
-        unsafe { device.map_memory(io_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::default()) }
-            .err_as_str()?
-            .cast::<IOBuf>();
-    unsafe { device.bind_buffer_memory(io_buffer, io_memory, 0) }
-        .err_as_str_context("bind_buffer_memory")?;
-
-    let (test_mem_reqs, test_buffer_create_info) =
-        memory_requirements(device, MIN_WANTED_ALLOCATION)?;
-
-    let test_mem_index = (0..memory_props.memory_type_count)
-        .filter(|mem_index| {
-            //test buffer comptibility flags expressed as bitmask
-            let memory_type = memory_props.memory_types[*mem_index as usize];
-            let suitable = (test_mem_reqs.memory_type_bits & (1 << mem_index)) != 0;
-            suitable
-                && memory_type
-                    .property_flags
-                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        })
-        .max_by_key(|mem_index| {
-            let memory_type = memory_props.memory_types[*mem_index as usize];
-            let heap_size = memory_props.memory_heaps[memory_type.heap_index as usize].size;
-            // Among greatest heap_size select index with HOST_VISIBLE flag if it is available,
-            // but with the minimum count of other flags and minimal index
-            (
-                heap_size,
-                memory_type
-                    .property_flags
-                    .contains(vk::MemoryPropertyFlags::HOST_VISIBLE),
-                std::cmp::Reverse(memory_type.property_flags),
-                std::cmp::Reverse(*mem_index),
-            )
-        })
-        .ok_or("DEVICE_LOCAL test memory type not available")?;
-
-    unsafe {
-        device.update_descriptor_sets(
-            &[vk::WriteDescriptorSetBuilder::new()
-                .dst_set(desc_sets[0])
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
-                    .buffer(io_buffer)
-                    .offset(0)
-                    .range(vk::WHOLE_SIZE)])],
-            &[],
-        );
-    }
-
-    let fence =
-        unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.err_as_str()?;
-
-    let submit_info = &[vk::SubmitInfoBuilder::new().command_buffers(&cmd_bufs)];
-
-    // Every window is a separate allocation and buffer, bound as one storage buffer descriptor.
-    // So a window must fit in maxStorageBufferRange, maxMemoryAllocationSize and maxBufferSize.
-    // Exceeding them is invalid usage, and on some drivers it silently drops writes,
-    // which then shows up as false memory errors.
-    let storage_range_limit = physical_props.limits.max_storage_buffer_range as i64;
-    let size_limits = selected.size_limits;
-    // Manual cap of the window size, for diagnosing drivers that mishandle big buffers
-    // (if errors disappear with smaller windows, the problem isn't the VRAM).
-    let window_size_override = env::var(MAX_WINDOW_MB_ENV)
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .filter(|&mb| mb > 0)
-        .map(|mb| max(mb.saturating_mul(1024 * 1024), TEST_WINDOW_SIZE_GRANULARITY));
-    if let Some(override_size) = window_size_override {
-        writeln!(
-            log_dupler,
-            "Test window size limited to {}MB by {MAX_WINDOW_MB_ENV}",
-            (override_size - override_size % TEST_WINDOW_SIZE_GRANULARITY) / (1024 * 1024)
-        )?;
-    }
-    let max_window_size = [
-        Some(storage_range_limit),
-        size_limits.max_memory_allocation_size,
-        size_limits.max_buffer_size,
-        window_size_override,
-    ]
-    .into_iter()
-    .flatten()
-    .map(|limit| limit - limit % TEST_WINDOW_SIZE_GRANULARITY)
-    .fold(TEST_WINDOW_MAX_SIZE, min);
-    if max_window_size < TEST_WINDOW_SIZE_GRANULARITY {
-        return Err(format!(
-            "device limits (maxStorageBufferRange 0x{storage_range_limit:X}, {size_limits:?}) are smaller than the minimal test window 0x{TEST_WINDOW_SIZE_GRANULARITY:X}"
-        )
-        .into());
-    }
-    if env.verbose() {
-        let _ = writeln!(
-            log_dupler,
-            "maxStorageBufferRange 0x{storage_range_limit:X}, {size_limits:?}, max test window {:5.3}GB",
-            max_window_size as f32 / GB
-        );
-    }
-
-    //all preparations except huge buffer allocation done. Now allocate huge buffer as a last step to minize chance of allocation failure for small structures
-
-    let mut test_memories: Vec<vk::DeviceMemory> = Vec::new();
-    let mut test_buffers: Vec<vk::Buffer> = Vec::new();
-    let mut test_window_count;
-    let mut test_window_size;
-    let mut warn_on_budget_alloc_fail = true;
-    let mut execute_wait_queue;
-    let mut init_errors_found = false;
-
-    //The error state before all allocation tries
-    let mut last_err: Box<dyn std::error::Error> =
-        "No heap reports memory enough for testing".into();
-    'memsize: loop {
-        free_test_mem_and_buffers(device, &mut test_buffers, &mut test_memories);
-
-        if allocation_size < MIN_WANTED_ALLOCATION {
-            return Err(last_err);
-        }
-
-        test_window_count =
-            allocation_size / max_window_size + i64::from(allocation_size % max_window_size != 0);
-        test_window_count = max(test_window_count, 2); //at least 2 windows: for testing rereads and rws
-        test_window_size = allocation_size / test_window_count;
-        test_window_size = test_window_size - test_window_size % TEST_WINDOW_SIZE_GRANULARITY;
-        if env.verbose() {
-            let _ = writeln!(
-                log_dupler,
-                "Trying {:7.3}GB as {} windows of {:5.3}GB...",
-                allocation_size as f32 / GB,
-                test_window_count,
-                test_window_size as f32 / GB
-            );
-        }
-        match allocate_test_windows(
-            device,
-            env,
-            test_buffer_create_info,
-            test_mem_index,
-            test_window_size,
-            test_window_count,
-            &mut test_buffers,
-            &mut test_memories,
-        ) {
-            Err(err) => last_err = err,
-            Ok(()) => {
-                // fill_marker: first fill the window with WRITE_MARKER (used before its initial write)
-                // pipeline: None records no dispatch (used by the skipped-write emulation)
-                execute_wait_queue = |window_idx: i64,
-                                      fill_marker: bool,
-                                      pipeline: Option<vk::Pipeline>|
-                 -> Result<(), Box<dyn std::error::Error>> {
-                    let test_element_count = (test_window_size / ELEMENT_SIZE) as u32;
-                    unsafe {
-                        device.update_descriptor_sets(
-                            &[vk::WriteDescriptorSetBuilder::new()
-                                .dst_set(desc_sets[0])
-                                .dst_binding(1)
-                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                                .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
-                                    .buffer(test_buffers[window_idx as usize])
-                                    .offset(0)
-                                    .range(test_window_size as u64)])],
-                            &[],
-                        );
-                        let cmd_buf = cmd_bufs[0];
-                        device
-                            .begin_command_buffer(cmd_buf, &vk::CommandBufferBeginInfo::default())
-                            .err_retry_with_lower_memory(env, "begin_command_buffer")?;
-                        if fill_marker {
-                            device.cmd_fill_buffer(
-                                cmd_buf,
-                                test_buffers[window_idx as usize],
-                                0,
-                                vk::WHOLE_SIZE,
-                                WRITE_MARKER,
-                            );
-                            // the fill must complete before the shader writes/reads the window
-                            device.cmd_pipeline_barrier(
-                                cmd_buf,
-                                vk::PipelineStageFlags::TRANSFER,
-                                vk::PipelineStageFlags::COMPUTE_SHADER,
-                                vk::DependencyFlags::empty(),
-                                &[vk::MemoryBarrierBuilder::new()
-                                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                                    .dst_access_mask(
-                                        vk::AccessFlags::SHADER_READ
-                                            | vk::AccessFlags::SHADER_WRITE,
-                                    )],
-                                &[],
-                                &[],
-                            );
-                        }
-                        if let Some(pipeline) = pipeline {
-                            device.cmd_bind_pipeline(
-                                cmd_buf,
-                                vk::PipelineBindPoint::COMPUTE,
-                                pipeline,
-                            );
-                            device.cmd_bind_descriptor_sets(
-                                cmd_buf,
-                                vk::PipelineBindPoint::COMPUTE,
-                                *pipeline_layout,
-                                0,
-                                &desc_sets,
-                                &[],
-                            );
-                            device.cmd_dispatch(
-                                cmd_buf,
-                                (TEST_WINDOW_1D_MAX_GROUPS / WG_SIZE) as u32,
-                                test_element_count
-                                    / VEC_SIZE as u32
-                                    / TEST_WINDOW_1D_MAX_GROUPS as u32,
-                                1,
-                            );
-                        }
-                        // Make shader writes to the IO buffer visible to the host:
-                        // waiting on the fence alone doesn't guarantee host visibility per the Vulkan spec,
-                        // and a stale IO buffer would be reported as a memory error.
-                        device.cmd_pipeline_barrier(
-                            cmd_buf,
-                            vk::PipelineStageFlags::COMPUTE_SHADER,
-                            vk::PipelineStageFlags::HOST,
-                            vk::DependencyFlags::empty(),
-                            &[vk::MemoryBarrierBuilder::new()
-                                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                                .dst_access_mask(vk::AccessFlags::HOST_READ)],
-                            &[],
-                            &[],
-                        );
-                        device
-                            .end_command_buffer(cmd_buf)
-                            .err_retry_with_lower_memory(env, "end_command_buffer")?;
-                        device
-                            .queue_submit(queue, submit_info, fence)
-                            .err_retry_with_lower_memory(env, "queue_submit")?;
-                        device
-                            .wait_for_fences(&[fence], true, u64::MAX)
-                            .err_retry_with_lower_memory(env, "wait_for_fences")?;
-                        device
-                            .reset_fences(&[fence])
-                            .err_retry_with_lower_memory(env, "reset_fences")?;
-                        Ok(())
-                    }
-                };
-                unsafe { std::ptr::write(mapped, IOBuf::for_initial_iteration()) }
-                //try to do initial memory fill to verify that allocation is really usable
-                let mut overall_exec_result = Ok(());
-                'window: for window_idx in 0..test_window_count {
-                    let test_offset = test_window_size * window_idx;
-                    // fill with WRITE_MARKER first, so values the write never reached are recognizable
-                    let skip_write =
-                        skip_write_iteration == Some(0) && window_idx == test_window_count - 1;
-                    let write_pipeline = (!skip_write).then_some(pipelines.write);
-                    if let Err(e) = execute_wait_queue(window_idx, true, write_pipeline) {
-                        overall_exec_result = Err(e);
-                        break 'window;
-                    }
-                    // reset error state per window, so each window's errors are reported once
-                    unsafe { std::ptr::write(mapped, IOBuf::for_initial_iteration()) }
-                    if let Err(e) = execute_wait_queue(window_idx, false, Some(pipelines.read)) {
-                        overall_exec_result = Err(e);
-                        break 'window;
-                    }
-                    // memory errors found by the initial fill are real errors too, don't drop them
-                    let init_buffer_out = unsafe { std::ptr::read(mapped) };
-                    init_errors_found |= report_window_errors(
-                        log_dupler,
-                        &init_buffer_out,
-                        test_offset,
-                        test_window_size,
-                        "INITIAL_READ",
-                    )
-                    .unwrap_or(true);
-                }
-                match overall_exec_result {
-                    Err(e) => last_err = e,
-                    Ok(()) => break 'memsize,
-                }
-            }
-        }
-        if env.verbose() {
-            let _ = writeln!(
-                log_dupler,
-                "Don't testing {:5.1}GB due to error: {}",
-                allocation_size as f32 / GB,
-                last_err
-            );
-        }
-        if !env.interactive {
-            close::immediate_exit(true);
-        }
-        if warn_on_budget_alloc_fail {
-            warn_on_budget_alloc_fail = false;
-            let _ = writeln!(
-                log_dupler,
-                "Failed allocating {:5.1}GB, trying to use smaller size. More system memory can help.",
-                allocation_size as f32 / GB
-            );
-        }
-        allocation_size -= ALLOCATION_TRY_STEP;
-    }
-
-    let test_memory_type = memory_props.memory_types[test_mem_index as usize];
-    if test_memory_type
-        .property_flags
-        .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
-    {
-        match unsafe {
-            device.map_memory(
-                test_memories[0],
-                0,
-                MAP_FOR_GETTING_ADDRESS_SIZE,
-                vk::MemoryMapFlags::default(),
-            )
-        }
-        .err_as_str()
-        {
-            Err(e) => {
-                if env.verbose() {
-                    let _ = writeln!(log_dupler, "Failed getting virtual address due to {e}");
-                }
-            }
-            Ok(virt_address) => {
-                let addr_details = ram::virt_addr_details(virt_address, physical_props.device_type);
-                unsafe { device.unmap_memory(test_memories[0]) }; // After getting addresses the actual mapping is not needed anymore
-                if let Some(details) = addr_details {
-                    writeln!(
-                        log_dupler,
-                        "CPU address of tested memory: virtual=x{:0pw$X} {}",
-                        virt_address.addr(),
-                        details,
-                        pw = ram::POINTER_HEX_PRINT_WIDTH
-                    )?
-                }
-            }
-        }
-    }
-
-    if env.verbose() {
-        let _ = writeln!(
-            log_dupler,
-            "Test memory size {:5.1}GB   type {:2}: {:?} {:?} suitable 0b{:032b}",
-            allocation_size as f32 / GB,
-            test_mem_index,
-            test_memory_type,
-            memory_props.memory_heaps[test_memory_type.heap_index as usize],
-            test_mem_reqs.memory_type_bits
-        );
-    }
-
-    // allow write bugs emulation for testing purposes
-    let emulate_write_bugs_iteration = env::var("MEMTEST_VULKAN_EMULATE_WRITE_BUG_ITERATION")
-        .ok()
-        .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or_default();
-    let iter_count = 100000000; //by default exit after several days of testing
-    let mut written_bytes = 0i64;
-    let mut read_bytes = 0i64;
-    let mut next_report_duration = time::Duration::from_secs(0);
-    let extended_test_report_duration = time::Duration::from_secs(30);
-    let mut reports_before_standard_done = 12i32;
-    let mut write_duration = time::Duration::ZERO;
-    let mut buffer_in = IOBuf::for_initial_iteration();
-    let first_iter_start = time::Instant::now();
-    let mut last_status_output = first_iter_start;
-    let mut last_error_state = if init_errors_found {
-        format!("LAST ERROR at {}", time::Duration::ZERO.hhmmssxxx())
-    } else {
-        "          NO ERRORS       ".to_owned()
-    };
-    for iteration in 1..=iter_count {
-        unsafe { std::ptr::write(mapped, buffer_in) }
-        let write_start = time::Instant::now();
-        for window_idx in 1..test_window_count {
-            unsafe {
-                (*mapped).calc_param = IOBuf::calc_param_for(buffer_in.iter, window_idx);
-            }
-            let write_pipeline = if skip_write_iteration == Some(iteration) && window_idx == 1 {
-                None // emulate a write that never reaches memory
-            } else if iteration != emulate_write_bugs_iteration {
-                Some(pipelines.write)
-            } else {
-                Some(pipelines.emulate_write_bugs)
-            };
-            execute_wait_queue(window_idx, false, write_pipeline)?;
-        }
-        written_bytes += test_window_size * (test_window_count - 1);
-        write_duration += write_start.elapsed();
-        let mut last_buffer_out: IOBuf;
-        for window_idx in 0..test_window_count {
-            let reread_mode_for_this_win = window_idx == 0;
-            buffer_in.calc_param = IOBuf::calc_param_for(buffer_in.iter, window_idx);
-            // The data this window held before this iteration's write: the initial fill
-            // (iteration 1 parameters, no window offset) or the previous iteration's write.
-            // Reading it back means this iteration's write never reached memory.
-            buffer_in.prev_calc_param = if iteration == 1 {
-                IOBuf::calc_param_for(1, 0)
-            } else {
-                IOBuf::calc_param_for(buffer_in.iter.wrapping_sub(1), window_idx)
-            };
-            buffer_in.check_stale = 1;
-            unsafe {
-                std::ptr::write(
-                    mapped,
-                    if reread_mode_for_this_win {
-                        IOBuf::for_initial_iteration()
-                    } else {
-                        buffer_in
-                    },
-                );
-            }
-            let test_offset = test_window_size * window_idx;
-            execute_wait_queue(window_idx, false, Some(pipelines.read))?;
-            {
-                unsafe {
-                    last_buffer_out = std::ptr::read(mapped);
-                }
-                if report_window_errors(
-                    log_dupler,
-                    &last_buffer_out,
-                    test_offset,
-                    test_window_size,
-                    if reread_mode_for_this_win {
-                        "NEXT_RE_READ"
-                    } else {
-                        "INITIAL_READ"
-                    },
-                )? {
-                    last_error_state =
-                        format!("LAST ERROR at {}", first_iter_start.elapsed().hhmmssxxx());
-                }
-                last_buffer_out.check_vec_first()?;
-            }
-        }
-        read_bytes += test_window_size * test_window_count;
-        let moment_iter_ends = time::Instant::now();
-        let elapsed = moment_iter_ends - last_status_output;
-        let stop_testing = close::close_requested();
-        if elapsed > next_report_duration || stop_testing {
-            let write_secs = write_duration.as_secs_f32();
-            let passed_secs = elapsed.as_secs_f32() - write_secs;
-            let write_speed_gbps = if write_secs > 0.0001 {
-                written_bytes as f32 / GB / write_secs
-            } else {
-                0f32
-            };
-            let check_speed_gbps = if passed_secs > 0.0001 {
-                read_bytes as f32 / GB / passed_secs
-            } else {
-                0f32
-            };
-            let second1 = time::Duration::from_secs(1);
-            if next_report_duration.is_zero() {
-                writeln!(log_dupler, "Standard 5-minute test of {}", selected_label)?;
-                next_report_duration = second1; //2nd report after 1 second
-            } else if next_report_duration == second1 {
-                close::raise_status_bit(close::app_status::INITED_OK);
-                next_report_duration = second1 * 5; //3rd report after 5 seconds
-            } else {
-                next_report_duration = extended_test_report_duration; //all later reports
-            }
-            if reports_before_standard_done == 0 {
-                let status = close::fetch_status();
-                let has_errors =
-                    close::check_any_bits_set(status, close::app_status::RUNTIME_ERRORS);
-                let writes_not_applied =
-                    close::check_any_bits_set(status, close::app_status::WRITES_NOT_APPLIED);
-                match (writes_not_applied, has_errors) {
-                    (true, _) => writeln!(
-                        log_dupler,
-                        "Standard 5-minute test INVALID - test writes were not applied (most likely a driver/tool problem)"
-                    ),
-                    (false, true) => {
-                        writeln!(log_dupler, "Standard 5-minute test fail - ERRORS FOUND")
-                    }
-                    (false, false) => writeln!(
-                        log_dupler,
-                        "Standard 5-minute test PASSed! Just press Ctrl+C unless you plan long test run."
-                    ),
-                }?;
-                writeln!(
-                    log_dupler,
-                    "Extended endless test started; testing more than 2 hours is usually unneeded"
-                )?;
-                writeln!(
-                    log_dupler,
-                    "use Ctrl+C to stop it when you decide it's enough"
-                )?;
-            } else {
-                let formatted_time_hhmmss = (moment_iter_ends - first_iter_start).hhmmssxxx();
-                writeln!(
-                    log_dupler,
-                    "{}    written:{:7.1}GB{:7.1}GB/s      checked:{:7.1}GB{:7.1}GB/s     {}",
-                    last_error_state,
-                    written_bytes as f32 / GB,
-                    write_speed_gbps,
-                    read_bytes as f32 / GB,
-                    check_speed_gbps,
-                    formatted_time_hhmmss
-                )?;
-            }
-            reports_before_standard_done -= 1;
-            if reports_before_standard_done == 0 {
-                // The last iteration before report has a sleep before it to test hot gpu behaviour
-                // in a situation of load pause and low-performance memory frequency
-                std::thread::sleep(next_report_duration / 2);
-            }
-            written_bytes = 0i64;
-            read_bytes = 0i64;
-            write_duration = time::Duration::ZERO;
-            last_status_output = time::Instant::now();
-        }
-        if stop_testing {
-            let _ = writeln!(log_dupler, "received user interruption, testing stopped");
-            break;
-        }
-        buffer_in.prepare_next_iter_write();
-    }
-    // Cleanup & Destruction
-    unsafe {
-        device.device_wait_idle().err_as_str()?;
-
-        free_test_mem_and_buffers(device, &mut test_buffers, &mut test_memories);
-
-        device.destroy_buffer(io_buffer, None);
-        device.unmap_memory(io_memory);
-        device.free_memory(io_memory, None);
-
-        device.destroy_fence(fence, None);
-    }
-    close::declare_exit_due_timeout();
-    Ok(())
-}
-
-struct NamedComputeDevice {
-    label: String,
-    physical_device: vk::PhysicalDevice,
-    queue_family_index: u32,
-    physical_props: vk::PhysicalDeviceProperties,
-    memory_props: vk::PhysicalDeviceMemoryProperties,
-    budget_props: ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXT,
-    index_in_device_iteration: usize,
-    size_limits: DeviceSizeLimits,
-}
-
-/// Per-device size limits that a single test window (one allocation + one buffer) must respect.
-/// None means the limit isn't reported by the driver.
-#[derive(Clone, Copy, Default, Debug)]
-struct DeviceSizeLimits {
-    /// VkPhysicalDeviceMaintenance3Properties::maxMemoryAllocationSize (Vulkan 1.1)
-    max_memory_allocation_size: Option<i64>,
-    /// VkPhysicalDeviceMaintenance4Properties::maxBufferSize (Vulkan 1.3 / VK_KHR_maintenance4)
-    max_buffer_size: Option<i64>,
-}
-
-fn load_instance<Writer: std::io::Write>(
-    env: &ProcessEnv,
-    log_dupler: &mut output::LogDupler<Writer>,
-) -> Result<
-    (
-        erupt::InstanceLoader,
-        EntryLoader,
-        vk::DebugUtilsMessengerEXT,
-    ),
-    Box<dyn std::error::Error>,
-> {
-    let override_vk_loader_debug = env::var_os(VK_LOADER_DEBUG).is_none();
-    if env.verbose() && override_vk_loader_debug {
-        // memtest_vulkan is single-threaded during init.
-        unsafe { env::set_var(VK_LOADER_DEBUG, "error,warn") };
-    }
-
-    let mut entry = new_loader()?;
-    if env.verbose() {
-        let _ = writeln!(
-            log_dupler,
-            "Verbose feature enabled (or 'verbose' found in name). Vulkan instance {}.{}.{}",
-            vk::api_version_major(entry.instance_version()),
-            vk::api_version_minor(entry.instance_version()),
-            vk::api_version_patch(entry.instance_version())
-        );
-        for (idx, prop) in unsafe { entry.enumerate_instance_layer_properties(None) }
-            .err_as_str()
-            .unwrap_or_default()
-            .iter()
-            .enumerate()
-        {
-            if idx == 0 {
-                let _ = writeln!(log_dupler, "Available: ");
-            } else {
-                let _ = write!(log_dupler, ", ");
-            }
-
-            let _ = write!(log_dupler, "{}", unsafe {
-                CStr::from_ptr(prop.layer_name.as_ptr())
-                    .to_str()
-                    .unwrap_or("Invalid property_name")
-            });
-        }
-        let _ = writeln!(log_dupler);
-        for (idx, ext) in unsafe { entry.enumerate_instance_extension_properties(None, None) }
-            .err_as_str()
-            .unwrap_or_default()
-            .iter()
-            .enumerate()
-        {
-            if idx == 0 {
-                let _ = write!(log_dupler, "Extensions: ");
-            } else {
-                let _ = write!(log_dupler, ", ");
-            }
-
-            let _ = write!(log_dupler, "{}", unsafe {
-                CStr::from_ptr(ext.extension_name.as_ptr())
-                    .to_str()
-                    .unwrap_or("Invalid extension_name")
-            });
-        }
-        let _ = writeln!(log_dupler);
-        let _ = writeln!(log_dupler);
-    }
-
-    let instance_extensions = vec![ext_debug_utils::EXT_DEBUG_UTILS_EXTENSION_NAME];
-
-    let app_info = vk::ApplicationInfoBuilder::new().api_version(vk::API_VERSION_1_1);
-    let instance_create_info = vk::InstanceCreateInfoBuilder::new()
-        .enabled_extension_names(&instance_extensions)
-        .enabled_layer_names(&*LAYER_KHRONOS_VALIDATION_ARRAY)
-        .application_info(&app_info);
-
-    let mut messenger = vk::DebugUtilsMessengerEXT::null();
-    match unsafe {
-        InstanceLoader::new(&entry, &instance_create_info)
-            .err_as_str_context("instance with validation")
-    } {
-        Ok(instance_with_validation) => {
-            let mut severity = ext_debug_utils::DebugUtilsMessageSeverityFlagsEXT::WARNING_EXT
-                | ext_debug_utils::DebugUtilsMessageSeverityFlagsEXT::ERROR_EXT;
-            if env.verbose() {
-                severity |= ext_debug_utils::DebugUtilsMessageSeverityFlagsEXT::INFO_EXT;
-                //lists all extensions, very verbose
-                //severity |= ext_debug_utils::DebugUtilsMessageSeverityFlagsEXT::VERBOSE_EXT;
-                let _ = writeln!(log_dupler, "DebugUtilsMessenger with seveity {severity:?}");
-            }
-            let create_info = ext_debug_utils::DebugUtilsMessengerCreateInfoEXTBuilder::new()
-                .message_severity(severity)
-                .message_type(ext_debug_utils::DebugUtilsMessageTypeFlagsEXT::all())
-                .pfn_user_callback(Some(debug_callback));
-            messenger = unsafe {
-                instance_with_validation.create_debug_utils_messenger_ext(&create_info, None)
-            }
-            .result()
-            .unwrap_or_default();
-            return Ok((instance_with_validation, entry, messenger));
-        }
-        Err(e) => {
-            if env.verbose() {
-                let _ = writeln!(log_dupler, "Not using validation layers due to {e}");
-            }
-        }
-    }
-
-    //fallback creation without validation and extensions
-    let simple_instance_try = unsafe {
-        InstanceLoader::new(
-            &entry,
-            &vk::InstanceCreateInfoBuilder::new()
-                .enabled_extension_names(&*NO_EXTENSIONS_ARRAY)
-                .application_info(&app_info),
-        )
-    }
-    .err_as_str_context("instance. Try specifying icd.json via VK_DRIVER_FILES env var");
-    match simple_instance_try {
-        Ok(instance) => Ok((instance, entry, messenger)),
-        Err(e) => {
-            if !override_vk_loader_debug {
-                return Err(e);
-            }
-            drop(entry);
-            //retry instance creation with loader debug enabled
-            // memtest_vulkan is single-threaded during init.
-            unsafe { env::set_var(VK_LOADER_DEBUG, "all") };
-            entry = new_loader()?;
-            let debug_instance_try = unsafe {
-                InstanceLoader::new(
-                    &entry,
-                    &vk::InstanceCreateInfoBuilder::new().application_info(&app_info),
-                )
-            }
-            .map_err(|_second_error_ignired| e)?;
-            Ok((debug_instance_try, entry, messenger))
-        }
-    }
-}
-struct LoadedDevices {
-    // use Option to enforce InstanceLoader must be dropped before EntryLoader inside Drop implementation;
-    // outside Drop theay are always Some
-    instance: Option<erupt::InstanceLoader>,
-    entry: Option<EntryLoader>,
-    messenger: vk::DebugUtilsMessengerEXT,
-    devices: Vec<NamedComputeDevice>,
-}
-
-impl LoadedDevices {
-    pub fn instance(&self) -> &erupt::InstanceLoader {
-        self.instance.as_ref().unwrap()
-    }
-    pub fn new(
-        instance: erupt::InstanceLoader,
-        entry: EntryLoader,
-        messenger: vk::DebugUtilsMessengerEXT,
-        devices: Vec<NamedComputeDevice>,
-    ) -> LoadedDevices {
-        LoadedDevices {
-            instance: Some(instance),
-            entry: Some(entry),
-            messenger,
-            devices,
-        }
-    }
-}
-impl Drop for LoadedDevices {
-    fn drop(&mut self) {
-        unsafe {
-            println!("Destroying vk instance...");
-            if !self.messenger.is_null() {
-                self.instance()
-                    .destroy_debug_utils_messenger_ext(self.messenger, None);
-            }
-            self.instance().destroy_instance(None);
-        }
-        self.instance = None;
-        self.entry = None;
-    }
-}
-fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
-    env: &ProcessEnv,
-    log_dupler: &mut output::LogDupler<Writer>,
-) -> Result<LoadedDevices, Box<dyn std::error::Error>> {
-    let (instance, entry, messenger) = load_instance(env, log_dupler)?;
-    //TODO: handle negative index passed as an internel index for using only single device during enumeration
-    let mut compute_capable_devices: Vec<_> = unsafe { instance.enumerate_physical_devices(None) }
-        .err_as_str()?
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index_in_device_iteration, physical_device)| unsafe {
-            if ![None, Some(index_in_device_iteration)]
-                .contains(&env.requested_index_in_device_iteration())
-            {
-                return None;
-            }
-            let queue_family = match instance
-                .get_physical_device_queue_family_properties(physical_device, None)
-                .into_iter()
-                .position(|properties| properties.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            {
-                Some(queue_family) => queue_family as u32,
-                None => return None,
-            };
-
-            // Only chain extension structures the device supports: passing structures of
-            // unsupported extensions in pNext is invalid usage per the Vulkan spec.
-            let device_extensions = instance
-                .enumerate_device_extension_properties(physical_device, None, None)
-                .result()
-                .unwrap_or_default();
-            let has_extension = |name: *const std::os::raw::c_char| {
-                let wanted = CStr::from_ptr(name);
-                device_extensions
-                    .iter()
-                    .any(|ext| CStr::from_ptr(ext.extension_name.as_ptr()) == wanted)
-            };
-            let has_pci_bus_info = has_extension(ext_pci_bus_info::EXT_PCI_BUS_INFO_EXTENSION_NAME);
-            let has_memory_budget =
-                has_extension(ext_memory_budget::EXT_MEMORY_BUDGET_EXTENSION_NAME);
-            let has_maintenance4 =
-                has_extension(khr_maintenance4::KHR_MAINTENANCE_4_EXTENSION_NAME);
-
-            let mut properties = instance.get_physical_device_properties(physical_device);
-            let effective_version = (
-                vk::api_version_major(properties.api_version),
-                vk::api_version_minor(properties.api_version),
-            );
-
-            let mut pci_structure_request =
-                ext_pci_bus_info::PhysicalDevicePCIBusInfoPropertiesEXTBuilder::new();
-
-            let mut budget_request =
-                ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXTBuilder::new();
-
-            let mut maintenance3_request = vk::PhysicalDeviceMaintenance3PropertiesBuilder::new();
-            let mut maintenance4_request = vk::PhysicalDeviceMaintenance4PropertiesBuilder::new();
-            // maxBufferSize: the instance is created for Vulkan 1.1, so using the 1.3 core
-            // structure is only valid when the device exposes it as VK_KHR_maintenance4
-            let query_maintenance4 = has_maintenance4;
-            let mut size_limits = DeviceSizeLimits::default();
-
-            //older vulkan implementations like broadcom on RaspberryPi lacks vk_1_1 support even if application requested it
-
-            let memory_props = if effective_version >= (1, 1) {
-                // maxMemoryAllocationSize is Vulkan 1.1 core
-                let mut device_props2 = vk::PhysicalDeviceProperties2Builder::new()
-                    .extend_from(&mut maintenance3_request);
-                if has_pci_bus_info {
-                    device_props2 = device_props2.extend_from(&mut pci_structure_request);
-                }
-                if query_maintenance4 {
-                    device_props2 = device_props2.extend_from(&mut maintenance4_request);
-                }
-
-                instance.get_physical_device_properties2(physical_device, &mut device_props2);
-                properties = device_props2.properties;
-                size_limits.max_memory_allocation_size =
-                    Some(maintenance3_request.max_memory_allocation_size as i64)
-                        .filter(|&size| size > 0);
-                if query_maintenance4 {
-                    size_limits.max_buffer_size =
-                        Some(maintenance4_request.max_buffer_size as i64).filter(|&size| size > 0);
-                }
-                let mut memory_props2 = vk::PhysicalDeviceMemoryProperties2Builder::new();
-                if has_memory_budget {
-                    memory_props2 = memory_props2.extend_from(&mut budget_request);
-                }
-                instance
-                    .get_physical_device_memory_properties2(physical_device, &mut memory_props2);
-                memory_props2.memory_properties
-            } else {
-                instance.get_physical_device_memory_properties(physical_device)
-            };
-            let pci_props_structure = *pci_structure_request;
-            let budget_props = *budget_request;
-
-            Some((
-                physical_device,
-                queue_family,
-                properties,
-                pci_props_structure,
-                memory_props,
-                budget_props,
-                index_in_device_iteration,
-                size_limits,
-            ))
-        })
-        .collect();
-    compute_capable_devices.sort_by_key(|(_, _, props, pci_props, _, _, _, _)| {
-        // assuming that for multi-GPU scenarious the minimal PCIe bus number is used for picture output
-        // and the maximal is the test target select by default "the descrete GPU with maximal PCIe bus number"
-        match props.device_type {
-            vk::PhysicalDeviceType::DISCRETE_GPU => (0, std::cmp::Reverse(pci_props.pci_bus)),
-            vk::PhysicalDeviceType::INTEGRATED_GPU => (1, std::cmp::Reverse(pci_props.pci_bus)),
-            _ => (2, std::cmp::Reverse(pci_props.pci_bus)),
-        }
-    });
-    let mut numbered_devices: Vec<NamedComputeDevice> = Vec::new();
-    for (i, d) in compute_capable_devices.iter().enumerate() {
-        let props = d.2;
-        let pci_props = d.3;
-        let api_info = if env.verbose() {
-            std::format!(
-                "-{}- API {}.{}.{}  {:?}",
-                d.6 + 1,
-                vk::api_version_major(props.api_version),
-                vk::api_version_minor(props.api_version),
-                vk::api_version_patch(props.api_version),
-                DriverVersionDebug(props.driver_version),
-            )
-        } else {
-            String::new()
-        };
-
-        let memory_props = d.4;
-        let mut total_mem_estimation = 0i64;
-        for i in 0..memory_props.memory_heap_count as usize {
-            if !memory_props.memory_heaps[i]
-                .flags
-                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-            {
-                continue;
-            }
-            total_mem_estimation = max(
-                total_mem_estimation,
-                memory_props.memory_heaps[i].size as i64,
-            );
-        }
-        numbered_devices.push(NamedComputeDevice {
-            label: std::format!(
-                "{}: Bus=0x{:02X}:{:02X} DevId=0x{:04X} {api_info}  {}GB {}",
-                i + 1,
-                pci_props.pci_bus,
-                pci_props.pci_device,
-                props.device_id,
-                (total_mem_estimation as f32 / GB).ceil(),
-                unsafe {
-                    CStr::from_ptr(props.device_name.as_ptr())
-                        .to_str()
-                        .unwrap_or("Invalid device_name")
-                }
-            ),
-            physical_device: d.0,
-            queue_family_index: d.1,
-            physical_props: props,
-            memory_props,
-            budget_props: d.5,
-            index_in_device_iteration: d.6,
-            size_limits: d.7,
-        });
-    }
-    Ok(LoadedDevices::new(
-        instance,
-        entry,
-        messenger,
-        numbered_devices,
-    ))
 }
 
 fn prompt_for_label(verbose: bool) -> Option<isize> {
@@ -1899,20 +98,21 @@ fn prompt_for_label(verbose: bool) -> Option<isize> {
     let mut prompt_duration: Option<time::Duration> = Some(time::Duration::from_secs(10));
 
     let mut input_reader = input::Reader::default();
-    let no_timer_prompt =
-        String::from("                                                   Override index to test:");
+    let no_timer_prompt = String::from(
+        "                                             Enter the number of the GPU to test:",
+    );
     loop {
         let mut prompt = &no_timer_prompt;
         let formatted_prompt: String;
         if let Some(effective_duration) = prompt_duration {
             if effective_duration < prompt_start.elapsed() {
                 println!();
-                println!("    ...first device autoselected");
+                println!("    ...testing GPU 1");
                 break;
             } else {
                 let duration_left = effective_duration - prompt_start.elapsed();
                 formatted_prompt = std::format!(
-                    "(first device will be autoselected in {} seconds)   Override index to test:",
+                    "(GPU 1 will be tested in {} seconds)   Enter the number of the GPU to test:",
                     duration_left.as_secs()
                 );
                 prompt = &formatted_prompt;
@@ -1932,7 +132,7 @@ fn prompt_for_label(verbose: bool) -> Option<isize> {
                     true => {
                         //empty or all zeroes
                         println!();
-                        println!("    ...testing default device confirmed");
+                        println!("    ...testing GPU 1");
                     }
                     false => match input_reader.current_input.parse::<isize>() {
                         Ok(parsed_idx) => {
@@ -1960,184 +160,165 @@ fn prompt_for_label(verbose: bool) -> Option<isize> {
     drop(input_reader);
     device_test_index
 }
-struct TestStatus {
-    test_status: u8,
-}
-fn test_in_this_process<Writer: std::io::Write>(
-    instance: &erupt::InstanceLoader,
-    selected: &NamedComputeDevice,
+
+/// Starts the worker process testing `device`. Returns its exit code, or None if it couldn't start
+fn run_worker<Writer: std::io::Write>(
+    device: &NamedComputeDevice,
     env: &ProcessEnv,
     log_dupler: &mut output::LogDupler<Writer>,
-) -> ! {
-    if !env.mem_budget_estimated() {
-        display_this_process_result(Some("Failed determining memory budget".into()), env)
+) -> Result<Option<u8>, Box<dyn std::error::Error>> {
+    let Some(argv0) = &env.argv0 else {
+        return Ok(None);
+    };
+    let options = &env.options;
+    let mut command = std::process::Command::new(argv0);
+    command
+        .arg("--worker")
+        .arg("--device-enumeration-index")
+        .arg(device.index_in_device_iteration.to_string())
+        .arg("--size")
+        .arg(env.max_test_bytes().to_string())
+        .arg("--duration")
+        .arg(options.duration.to_arg());
+    if let Some(window_mb) = options.window_mb {
+        command.arg("--window-mb").arg(window_mb.to_string());
     }
-
-    prepare_and_test_device(instance, selected, env, log_dupler)
+    match &env.log_path {
+        Some(log_path) => command.arg("--log").arg(log_path),
+        None => command.arg("--no-log"),
+    };
+    if env.verbose() {
+        command.arg("--verbose");
+    }
+    let _ = log_dupler.flush();
+    let Ok(mut child) = command.spawn() else {
+        return Ok(None);
+    };
+    if env.verbose() {
+        let _ = writeln!(log_dupler, "Started worker process {}", child.id());
+    }
+    let wait_result = child.wait();
+    let parent_close_requested = close::close_requested();
+    let exit_status =
+        wait_result.map_err(|e| format!("Problem waiting for the test process: {e}"))?;
+    if env.verbose() {
+        let _ = writeln!(
+            log_dupler,
+            "Worker exit status {exit_status}, Ctrl+C pressed: {parent_close_requested}"
+        );
+    }
+    let code = exit_status
+        .code()
+        .ok_or("The test process was terminated without an exit code")?;
+    let status = code as u8;
+    if (status & close::app_status::SIGNATURE_MASK) != close::app_status::SIGNATURE {
+        return Err(format!("The test process failed with exit code {code}").into());
+    }
+    let expected_end = parent_close_requested
+        || close::check_any_bits_set(
+            status,
+            close::app_status::QUIT_JOB_REQUESTED | close::app_status::COMPLETED,
+        )
+        || status == (close::app_status::SIGNATURE | close::app_status::RUNTIME_ABORT);
+    if !expected_end {
+        let _ = writeln!(
+            log_dupler,
+            "The test process ended unexpectedly (exit code {code})"
+        );
+        return Ok(Some(status | close::app_status::RUNTIME_ABORT));
+    }
+    Ok(Some(status))
 }
 
-enum SubprocessMode {
-    NotExeced,
-    FailedRetryLowerMemory,
-    DoneOrFailedNoretry,
-}
-fn test_selected_label<Writer: std::io::Write>(
+/// Tests the single device left in `loaded_devices`, in a worker process if possible
+fn test_selected_device<Writer: std::io::Write>(
     loaded_devices: LoadedDevices,
     env: &ProcessEnv,
     log_dupler: &mut output::LogDupler<Writer>,
-) -> Result<(Option<LoadedDevices>, TestStatus), Box<dyn std::error::Error>> {
-    // prevent running drop on loaded_devices
-
-    match loaded_devices.devices.as_slice() {
-        [single_dev] => {
-            if env.interactive {
-                let mut mode;
-                let mut main_code: u8 = 0;
-                loop {
-                    mode = SubprocessMode::NotExeced;
-                    if let Some(argv0) = &env.argv0
-                        && let Ok(mut child) = std::process::Command::new(argv0)
-                            .arg((-1 - (single_dev.index_in_device_iteration as isize)).to_string())
-                            .arg(env.max_test_bytes.load(SeqCst).to_string())
-                            .spawn()
-                    {
-                        if env.verbose() {
-                            let _ = writeln!(
-                                log_dupler,
-                                "Spawned child {child:?} with PID {}",
-                                child.id()
-                            );
-                        }
-                        let wait_result = child.wait();
-                        let parent_close_requested = close::close_requested();
-                        match wait_result {
-                            Err(e) => {
-                                let _ = writeln!(
-                                    log_dupler,
-                                    "wait error: {e}  parent_close_requested: {parent_close_requested}"
-                                );
-                                return Err("Problem waiting for subprocess".into());
-                            }
-                            Ok(exit_status) => {
-                                if env.verbose() {
-                                    let _ = writeln!(
-                                        log_dupler,
-                                        "Subprocess status {exit_status} parent_close_requested {parent_close_requested}"
-                                    );
-                                }
-                                match exit_status.code() {
-                                    None => {
-                                        return Err(
-                                            "Exit code of test process not available".into()
-                                        );
-                                    }
-                                    Some(subprocess_code) => {
-                                        main_code = subprocess_code as u8;
-                                        let strange_code = (main_code
-                                            & close::app_status::SIGNATURE_MASK)
-                                            != close::app_status::SIGNATURE;
-                                        if strange_code {
-                                            let _ = writeln!(
-                                                log_dupler,
-                                                "Unexpected code {subprocess_code}"
-                                            );
-                                            return Err(
-                                                "Exit code of test process can't be interpreted"
-                                                    .into(),
-                                            );
-                                        }
-                                        if main_code
-                                            == (close::app_status::SIGNATURE
-                                                | close::app_status::RUNTIME_ABORT)
-                                        {
-                                            mode = SubprocessMode::FailedRetryLowerMemory;
-                                        } else {
-                                            mode = SubprocessMode::DoneOrFailedNoretry;
-                                            if !parent_close_requested
-                                                && !close::check_any_bits_set(
-                                                    main_code,
-                                                    close::app_status::QUIT_JOB_REQUESTED,
-                                                )
-                                            {
-                                                let _ = writeln!(
-                                                    log_dupler,
-                                                    "Seems child exited for no reason, code {subprocess_code}"
-                                                );
-                                                main_code |= close::app_status::RUNTIME_ABORT;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    match mode {
-                        SubprocessMode::NotExeced => {
-                            let _ =
-                                writeln!(log_dupler, "Subprocess testing method not available!");
-                            break;
-                        }
-                        SubprocessMode::FailedRetryLowerMemory => {
-                            let tried_bytes = env.max_test_bytes.load(SeqCst);
-                            let smaller_memory = tried_bytes - ALLOCATION_TRY_STEP;
-                            if smaller_memory < MIN_WANTED_ALLOCATION {
-                                let _ = writeln!(
-                                    log_dupler,
-                                    "Subprocess testing method failed even with small memory limit {tried_bytes}"
-                                );
-                                break;
-                            }
-                            env.set_mem_budget_limit(smaller_memory);
-                            if env.verbose() {
-                                let _ = writeln!(
-                                    log_dupler,
-                                    "retrying subprocess with smaller memory limit {smaller_memory}"
-                                );
-                            }
-                            continue;
-                        }
-                        SubprocessMode::DoneOrFailedNoretry => {
-                            return Ok((
-                                Some(loaded_devices),
-                                TestStatus {
-                                    test_status: main_code
-                                        | (close::fetch_status()
-                                            & close::app_status::QUIT_JOB_REQUESTED),
-                                },
-                            ));
-                        }
-                    }
+) -> Result<u8, Box<dyn std::error::Error>> {
+    let [single_dev] = loaded_devices.devices.as_slice() else {
+        env.make_verbose();
+        return Err(
+            "While asking selected device exactly 1 device need to present and already selected"
+                .into(),
+        );
+    };
+    if env.interactive {
+        loop {
+            match run_worker(single_dev, env, log_dupler)? {
+                None => {
+                    let _ = writeln!(log_dupler, "Couldn't start the test process!");
+                    break;
                 }
-                env.make_verbose();
-                let _ = writeln!(log_dupler, "Falled back to verbose in-process test method");
+                // the worker exits like this when the driver fails during allocation
+                Some(status)
+                    if status
+                        == (close::app_status::SIGNATURE | close::app_status::RUNTIME_ABORT) =>
+                {
+                    let tried_bytes = env.max_test_bytes();
+                    let smaller_memory = tried_bytes - ALLOCATION_TRY_STEP;
+                    if smaller_memory < MIN_WANTED_ALLOCATION {
+                        let _ = writeln!(
+                            log_dupler,
+                            "The test failed even with {:.1}GB of memory",
+                            tried_bytes as f32 / GB
+                        );
+                        break;
+                    }
+                    env.set_mem_budget_limit(smaller_memory);
+                    let _ = writeln!(
+                        log_dupler,
+                        "Retrying with less memory: {:.1}GB",
+                        smaller_memory as f32 / GB
+                    );
+                }
+                Some(status) => {
+                    return Ok(
+                        status | (close::fetch_status() & close::app_status::QUIT_JOB_REQUESTED)
+                    );
+                }
             }
-
-            test_in_this_process(loaded_devices.instance(), single_dev, env, log_dupler);
         }
-        _ => {
-            env.make_verbose();
-            Err("While asking selected device exactly 1 device need to present and already selected".into())
-        }
+        env.make_verbose();
+        let _ = writeln!(
+            log_dupler,
+            "Falling back to testing in this process, with diagnostic output"
+        );
     }
+    tester::prepare_and_test_device(loaded_devices.instance(), single_dev, env, log_dupler);
 }
-fn init_vk_and_check_errors<Writer: std::io::Write>(
+
+/// Shows the devices, selects one and tests it
+fn select_device_and_test<Writer: std::io::Write>(
     mut loaded_devices: LoadedDevices,
     env: &ProcessEnv,
     log_dupler: &mut output::LogDupler<Writer>,
-) -> Result<(Option<LoadedDevices>, TestStatus), Box<dyn std::error::Error>> {
+) -> Result<u8, Box<dyn std::error::Error>> {
     if env.interactive {
-        let _ = writeln!(log_dupler,);
+        let _ = writeln!(log_dupler);
         for desc in loaded_devices.devices.iter() {
             let _ = writeln!(log_dupler, "{}", desc.label);
         }
-        if loaded_devices.devices.len() > 1 {
-            if let Some(selected_label) = prompt_for_label(env.verbose()) {
+        if loaded_devices.devices.is_empty() {
+            return Err("No GPU able to run Vulkan compute shaders was found. Check that the GPU driver is installed.".into());
+        }
+        if env.options.list {
+            let _ = log_dupler.flush();
+            close::exit_process(exit_code::PASSED);
+        }
+        if loaded_devices.devices.len() > 1 && env.options.device.is_none() {
+            if env.options.batch {
+                let _ = writeln!(
+                    log_dupler,
+                    "Testing GPU 1, use --device to choose another one"
+                );
+            } else if let Some(selected_label) = prompt_for_label(env.verbose()) {
                 env.device_label.store(selected_label, SeqCst);
             } else {
-                return Err("Test cancelled, no device selected".into());
+                return Err("Test cancelled, no GPU selected".into());
             }
         }
-        close::setup_handler(true); //for interactive environments setup handler only after input prompt was run
+        close::setup_handler(close::HandlerMode::Graceful); //for interactive environments setup handler only after input prompt was run
     }
 
     let index_from_1 = env.effective_index_in_loaded_devices() + 1;
@@ -2147,99 +328,104 @@ fn init_vk_and_check_errors<Writer: std::io::Write>(
         .nth(index_from_1 - 1)
     {
         None => {
-            env.make_verbose();
-            return Err(format!("Specified device index ({index_from_1}) greater then available device count: {available_len}").into());
+            return Err(format!(
+                "There is no GPU number {index_from_1}, found {available_len} GPU(s)"
+            )
+            .into());
         }
         Some(selected) => selected,
     };
 
-    try_fill_default_mem_budget(&selected, env, log_dupler);
-    loaded_devices.devices = vec![selected];
-
-    test_selected_label(loaded_devices, env, log_dupler)
-}
-
-#[derive(Default)]
-struct ProcessEnv {
-    argv0: Option<OsString>,
-    device_label: AtomicIsize, //0 = autoselect, >0 index as displayed&sorted by memtest_vulkan, <0 -index as reported by device enumeration
-    max_test_bytes: AtomicI64,
-    verbose_requested: AtomicBool,
-    interactive: bool,
-}
-
-impl ProcessEnv {
-    fn effective_index_in_loaded_devices(&self) -> usize {
-        // converts internal represntation to always-nonnegative index
-        // 0 or nagative value means that selection is done at the moment of filling loaded_devices
-        // so report selected index if positive and 0 otherwise
-        (self.device_label.load(SeqCst) - 1).try_into().unwrap_or(0)
+    if env.verbose() {
+        let _ = writeln!(log_dupler, "Loading memory info for selected device...");
     }
-
-    fn requested_index_in_device_iteration(&self) -> Option<usize> {
-        // convert negative value to an index, zero or positive values convert to None
-        (-1 - self.device_label.load(SeqCst)).try_into().ok()
-    }
-
-    fn verbose(&self) -> bool {
-        self.verbose_requested.load(SeqCst)
-    }
-
-    fn make_verbose(&self) {
-        self.verbose_requested.store(true, SeqCst)
-    }
-
-    fn mem_budget_estimated(&self) -> bool {
-        self.max_test_bytes.load(SeqCst) > 0
-    }
-
-    fn set_mem_budget_limit(&self, new_limit: i64) {
-        if self.mem_budget_estimated() {
-            let old_limit = self.max_test_bytes.fetch_min(new_limit, SeqCst);
-            assert!(old_limit >= new_limit);
-        } else {
-            let old_limit = self.max_test_bytes.swap(new_limit, SeqCst);
-            assert!(old_limit == 0);
+    if !env.mem_budget_estimated() || env.interactive {
+        let estimate = selected.estimate_testable_memory(env, log_dupler);
+        match env.options.size {
+            Some(size) => {
+                if estimate > 0 && size > estimate {
+                    let _ = writeln!(
+                        log_dupler,
+                        "WARNING: --size {:.1}GB is more than the free VRAM estimate of {:.1}GB. The driver may\n\
+                         swap test memory to system RAM, so part of the test wouldn't check VRAM.",
+                        size as f32 / GB,
+                        estimate as f32 / GB
+                    );
+                }
+                env.set_mem_budget_limit(size);
+            }
+            None => env.set_mem_budget_limit(estimate),
         }
     }
+    if !env.mem_budget_estimated() {
+        return Err("Couldn't determine how much memory to test, use --size".into());
+    }
+    loaded_devices.devices = vec![selected];
+    test_selected_device(loaded_devices, env, log_dupler)
 }
 
 fn init_running_env() -> ProcessEnv {
-    let mut process_env = ProcessEnv {
-        verbose_requested: AtomicBool::new(cfg!(feature = "verbose")),
+    let mut args = std::env::args_os();
+    let argv0 = args.next();
+    let options = match cli::parse(args) {
+        Ok(cli::Command::Run(options)) => options,
+        Ok(cli::Command::Help) => {
+            println!(
+                "memtest_vulkan v{} by GpuZelenograd, https://github.com/GpuZelenograd/memtest_vulkan\n",
+                env!("CARGO_PKG_VERSION")
+            );
+            print!("{}", cli::HELP);
+            close::exit_process(exit_code::PASSED);
+        }
+        Ok(cli::Command::Version) => {
+            println!("memtest_vulkan v{}", env!("CARGO_PKG_VERSION"));
+            close::exit_process(exit_code::PASSED);
+        }
+        Err(message) => {
+            eprintln!("memtest_vulkan: {message}");
+            close::exit_process(exit_code::NOT_RUN);
+        }
+    };
+    let verbose_name = argv0
+        .as_ref()
+        .and_then(|argv0| {
+            std::path::Path::new(argv0)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| stem.to_ascii_lowercase().contains("verbose"))
+        })
+        .unwrap_or_default();
+    let log_path = match &options.log {
+        cli::LogTarget::Default => Some(PathBuf::from("memtest_vulkan.log")),
+        cli::LogTarget::File(path) => Some(path.clone()),
+        cli::LogTarget::Disabled => None,
+    }
+    .map(|path| std::path::absolute(&path).unwrap_or(path));
+    let process_env = ProcessEnv {
+        verbose_requested: AtomicBool::new(
+            cfg!(feature = "verbose") || options.verbose || verbose_name,
+        ),
+        argv0,
+        interactive: !options.worker,
+        log_path,
         ..Default::default()
     };
-    let mut args_os_iter = std::env::args_os();
-    if let Some(argv0) = args_os_iter.next() {
-        if let Some(file_stem) = std::path::PathBuf::from(&argv0)
-            .file_stem()
-            .and_then(|os_str| os_str.to_str())
-            && file_stem.to_ascii_lowercase().contains("verbose")
-        {
-            process_env.make_verbose();
-        }
-        process_env.argv0 = Some(argv0);
-        process_env.interactive = true;
-        if let Some(argv1_label_str) = args_os_iter
-            .next()
-            .as_ref()
-            .and_then(|os_str| os_str.to_str())
-        {
-            if let Ok(label_parsed) = argv1_label_str.parse::<isize>() {
-                process_env.interactive = false;
-                process_env.device_label.store(label_parsed, SeqCst);
-            }
-            if let Some(argv2_mem_max_str) = args_os_iter
-                .next()
-                .as_ref()
-                .and_then(|os_str| os_str.to_str())
-                && let Ok(mem_max_parsed) = argv2_mem_max_str.parse::<i64>()
-            {
-                process_env.set_mem_budget_limit(mem_max_parsed);
-            }
-        }
+    if let Some(device) = options.device {
+        process_env.device_label.store(device as isize, SeqCst);
     }
-    if process_env.interactive {
+    if let Some(index) = options.device_enumeration_index {
+        process_env.device_label.store(-1 - index as isize, SeqCst);
+    }
+    if options.worker
+        && let Some(size) = options.size
+    {
+        process_env.set_mem_budget_limit(size);
+    }
+    let process_env = ProcessEnv {
+        options,
+        ..process_env
+    };
+    if process_env.interactive && !process_env.options.list {
         print!("https://github.com/GpuZelenograd/");
         let _ = std::io::stdout().flush();
         let mut color_setter = input::Reader::default();
@@ -2249,12 +435,12 @@ fn init_running_env() -> ProcessEnv {
             env!("CARGO_PKG_VERSION")
         );
         drop(color_setter);
-        println!("To finish testing use Ctrl+C");
+        println!("Press Ctrl+C to stop testing early. Options: memtest_vulkan --help");
     }
     process_env
 }
 
-fn display_this_process_result(
+pub fn display_this_process_result(
     maybe_err: Option<Box<dyn std::error::Error>>,
     env: &ProcessEnv,
 ) -> ! {
@@ -2262,68 +448,83 @@ fn display_this_process_result(
         println!("Runtime error: {e}");
         close::raise_status_bit(close::app_status::RUNTIME_ABORT);
     }
-    display_testing_outcome(
-        TestStatus {
-            test_status: close::fetch_status(),
-        },
-        env,
-    )
+    display_testing_outcome(close::fetch_status(), env)
 }
 
-fn display_testing_outcome(test_status: TestStatus, env: &ProcessEnv) -> ! {
+/// The verdict for the final status bits: exit code, message, and whether it's a failure
+/// (for the accent color; None for no color)
+fn outcome(status: u8) -> (u32, String, Option<bool>) {
+    use close::{app_status::*, check_any_bits_set as has};
+    if has(status, WRITES_NOT_APPLIED) {
+        let mut message = "memtest_vulkan: RESULTS INVALID - test writes didn't reach the memory.\n\
+             Most likely a GPU driver or memtest_vulkan problem rather than faulty VRAM - see the log."
+            .to_owned();
+        if has(status, RUNTIME_ERRORS) {
+            message += "\nOther memory errors were found as well.";
+        }
+        (exit_code::WRITES_NOT_APPLIED, message, Some(true))
+    } else if has(status, RUNTIME_ERRORS) {
+        (
+            exit_code::ERRORS_FOUND,
+            "memtest_vulkan: memory/gpu ERRORS FOUND, test FAILED.".to_owned(),
+            Some(true),
+        )
+    } else if has(status, RUNTIME_ABORT) {
+        let message = if has(status, INITED_OK) {
+            "memtest_vulkan: no errors found, but the test stopped because of a runtime error."
+        } else {
+            "memtest_vulkan: the test couldn't run because of a runtime error."
+        };
+        (exit_code::NOT_RUN, message.to_owned(), Some(true))
+    } else if has(status, COMPLETED) {
+        (
+            exit_code::PASSED,
+            "memtest_vulkan: no errors, test PASSED.".to_owned(),
+            Some(false),
+        )
+    } else {
+        (
+            exit_code::INCOMPLETE,
+            "memtest_vulkan: no errors so far, but the test was stopped early (incomplete)."
+                .to_owned(),
+            None,
+        )
+    }
+}
+
+fn display_testing_outcome(status: u8, env: &ProcessEnv) -> ! {
     if !env.interactive {
+        // the worker reports the status bits to the console process
         close::immediate_exit(false);
     }
     println!();
     let mut key_reader = input::Reader::default();
-    let status = test_status.test_status;
     if close::check_any_bits_set(status, close::app_status::QUIT_JOB_REQUESTED) {
         //propagate closing flag to this process, so no risky-during close functions would be used
         close::raise_status_bit(close::app_status::QUIT_JOB_REQUESTED);
     }
-    if close::check_any_bits_set(status, close::app_status::WRITES_NOT_APPLIED) {
-        if env.interactive {
-            key_reader.set_pass_fail_accent_color(true);
-        }
-        println!(
-            "memtest_vulkan: test writes were NOT APPLIED, results are INVALID.\n\
-             Most likely a GPU driver or memtest_vulkan problem rather than faulty VRAM - see the log."
-        );
-        if close::check_any_bits_set(status, close::app_status::RUNTIME_ERRORS) {
-            println!("memtest_vulkan: other memory/gpu ERRORS were found as well.");
-        }
-    } else if !close::check_any_bits_set(status, close::app_status::INITED_OK) {
-        println!("memtest_vulkan: INIT OR FIRST testing failed due to runtime error");
-    } else if close::check_any_bits_set(status, close::app_status::RUNTIME_ABORT)
-        && !close::check_any_bits_set(status, close::app_status::RUNTIME_ERRORS)
-    {
-        println!("memtest_vulkan: First test passed, but THEN runtime error occured");
-    } else {
-        let has_errors = close::check_any_bits_set(status, close::app_status::RUNTIME_ERRORS);
-        if env.interactive {
-            key_reader.set_pass_fail_accent_color(has_errors);
-        }
-        match has_errors {
-            true => println!("memtest_vulkan: memory/gpu ERRORS FOUND, testing finished."),
-            false => println!("memtest_vulkan: no any errors, testing PASSed."),
-        }
+    let (code, message, failed) = outcome(status);
+    if let Some(failed) = failed {
+        key_reader.set_pass_fail_accent_color(failed);
     }
-    if env.interactive {
+    println!("{message}");
+    if env.wait_for_key() {
         key_reader.wait_any_key(true);
     }
     drop(key_reader); //restore terminal state before exiting
-    close::immediate_exit(false)
+    let _ = std::io::stdout().flush();
+    close::exit_process(code)
 }
 
 fn display_result<Writer: std::io::Write>(
-    result: Result<(Option<LoadedDevices>, TestStatus), Box<dyn std::error::Error>>,
+    result: Result<u8, Box<dyn std::error::Error>>,
     env: &ProcessEnv,
     log_dupler: &mut output::LogDupler<Writer>,
 ) -> ! {
     match result {
-        Ok((_, test_status)) => {
+        Ok(status) => {
             let _ = log_dupler.flush();
-            display_testing_outcome(test_status, env)
+            display_testing_outcome(status, env)
         }
         Err(e) => {
             if env.interactive || env.verbose() {
@@ -2332,7 +533,7 @@ fn display_result<Writer: std::io::Write>(
                 let mut error_fmt = format!("{e}");
                 let _ = writeln!(
                     log_dupler,
-                    "memtest_vulkan early exit during init:\n{error_fmt}"
+                    "memtest_vulkan couldn't start testing:\n{error_fmt}"
                 );
                 let mut source = e.source();
                 while let Some(inner) = source {
@@ -2345,13 +546,16 @@ fn display_result<Writer: std::io::Write>(
                     source = inner.source();
                 }
                 let _ = log_dupler.flush();
-                if env.interactive {
+                if env.wait_for_key() {
                     let mut key_reader = input::Reader::default();
                     key_reader.wait_any_key(true);
                     drop(key_reader); //restore terminal state before exiting
                 }
             }
-            close::immediate_exit(false)
+            if !env.interactive {
+                close::immediate_exit(true)
+            }
+            close::exit_process(exit_code::NOT_RUN)
         }
     }
 }
@@ -2359,13 +563,17 @@ fn display_result<Writer: std::io::Write>(
 fn main() {
     let env = init_running_env();
     if !env.interactive {
-        close::setup_handler(false);
+        // first Ctrl+C finishes the current pass and prints the summary, the second one quits at once
+        close::setup_handler(close::HandlerMode::GracefulThenImmediate);
+    } else if env.options.batch {
+        close::setup_handler(close::HandlerMode::Graceful);
     }
     const MAX_LOG_SIZE: u64 = 50 * 1024 * 1024;
-    //log is put in current directory. This is intentional - run from other dir to use another log
     let mut log_dupler = output::LogDupler::new(
         std::io::stdout(),
-        Some("memtest_vulkan.log".into()),
+        env.log_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
         MAX_LOG_SIZE,
         if env.interactive {
             "Tester console"
@@ -2373,96 +581,13 @@ fn main() {
             "Tester worker"
         },
     );
-    let result = list_devices_ordered_labaled_from_1(&env, &mut log_dupler)
-        .and_then(|loaded_devices| init_vk_and_check_errors(loaded_devices, &env, &mut log_dupler));
+    if env.interactive
+        && !env.options.list
+        && let Some(log_path) = &env.log_path
+    {
+        let _ = writeln!(log_dupler, "Log file: {}", log_path.display());
+    }
+    let result = devices::list_devices_ordered_labeled_from_1(&env, &mut log_dupler)
+        .and_then(|loaded_devices| select_device_and_test(loaded_devices, &env, &mut log_dupler));
     display_result(result, &env, &mut log_dupler);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// IOBuf as the read shader leaves it after finding errors in [idx_min, idx_max]
-    fn with_errors(idx_min: u32, idx_max: u32) -> IOBuf {
-        let mut buf = IOBuf::for_initial_iteration();
-        buf.idx_min = idx_min;
-        buf.idx_max = idx_max;
-        buf.done_iter_or_err = 0xFFFF_FFFF;
-        buf
-    }
-
-    #[test]
-    fn no_errors_is_not_unwritten() {
-        assert_eq!(IOBuf::for_initial_iteration().unwritten_evidence(), None);
-    }
-
-    #[test]
-    fn block_of_marker_or_stale_values_is_unwritten() {
-        // whole 2GB window still holding the marker, as with a skipped initial write
-        let mut buf = with_errors(0, 0x1FFF_FFFF);
-        buf.mem_bitcount.0[16] = 0x2000_0000;
-        buf.unwritten_count = 0x2000_0000;
-        assert_eq!(
-            buf.unwritten_evidence(),
-            Some(UnwrittenEvidence::MarkerOrStale(0x2000_0000))
-        );
-    }
-
-    #[test]
-    fn scattered_writes_not_sticking_are_real_errors() {
-        // unstable memory where some writes don't stick leaves old data in scattered places:
-        // that's a memory fault and must not be excused as a driver problem
-        let mut buf = with_errors(0x100, 0x3BFF_FFFF);
-        buf.mem_bitcount.0[16] = 0x500;
-        buf.unwritten_count = 0x500;
-        assert_eq!(buf.unwritten_evidence(), None);
-    }
-
-    #[test]
-    fn whole_window_of_zeros_is_unwritten() {
-        // Real failure on Intel Arc B580 with a 10.5GB single buffer exceeding maxBufferSize:
-        // "Errors address range: 0xA0000000..=0xDFFFFFFF", every value read as 0x00000000
-        let mut buf = with_errors(0xA000_0000 / 4, 0xDFFF_FFFF / 4);
-        buf.mem_bitcount.0[0] = 0x1000_0000;
-        assert_eq!(
-            buf.unwritten_evidence(),
-            Some(UnwrittenEvidence::ZeroBlock(0x1000_0000))
-        );
-    }
-
-    #[test]
-    fn scattered_bit_flips_are_real_errors() {
-        // README example of real VRAM errors: few wrong values spread over a big range
-        let mut buf = with_errors(0x100, 0x3BFF_FFFF);
-        buf.mem_bitcount.0[15] = 0x1000;
-        buf.mem_bitcount.0[16] = 0x2000;
-        buf.mem_bitcount.0[0] = 3;
-        assert_eq!(buf.unwritten_evidence(), None);
-    }
-
-    #[test]
-    fn small_zero_area_is_a_real_error() {
-        let mut buf = with_errors(0x1000, 0x1000 + 0x100 - 1);
-        buf.mem_bitcount.0[0] = 0x100;
-        assert_eq!(buf.unwritten_evidence(), None);
-    }
-
-    #[test]
-    fn calc_param_matches_previous_scheme() {
-        let mut buf = IOBuf::for_initial_iteration();
-        for _ in 0..5 {
-            buf.prepare_next_iter_write();
-        }
-        buf.set_calc_param_for_starting_window();
-        assert_eq!(IOBuf::calc_param_for(buf.iter, 0), buf.calc_param);
-        assert_eq!(
-            IOBuf::calc_param_for(buf.iter, 3),
-            buf.calc_param.wrapping_add(3 * 0x81)
-        );
-        // wraps like u32 arithmetic in the shader instead of panicking
-        assert_eq!(
-            IOBuf::calc_param_for(u32::MAX, 2),
-            u32::MAX.wrapping_mul(0x100107).wrapping_add(2 * 0x81)
-        );
-    }
 }
