@@ -159,7 +159,8 @@ impl<Writer: io::Write> Drop for LogDupler<Writer> {
 }
 impl<Writer: io::Write> Write for LogDupler<Writer> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let _ = self.writer.write(buf);
+        // write_all: a plain write may accept only part of the buffer, cutting console output
+        let _ = self.writer.write_all(buf);
         self.unlogged_buffer.extend(buf);
         if let Some(rev_position) = self.unlogged_buffer.iter().rev().position(|c| c == &b'\n') {
             self.write_deq_start(self.unlogged_buffer.len() - rev_position);
