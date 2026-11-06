@@ -259,6 +259,15 @@ Since most of the time the GPUs are working fine, it may be hard to check the er
 The idea inspired by OpenCL-based cross-platform memory testing tool [memtestCL](https://github.com/ihaque/memtestCL).
 
 The implementation would not be possible without great vulkan bindings for rust provided by zlib-licensed [erupt library](https://gitlab.com/Friz64/erupt).
-So, for licensing simplicity, memtest_vulkan is also licensed under the [zlib License](https://github.com/GpuZelenograd/memtest_vulkan/blob/main/LICENSE).
+So, for licensing simplicity, the original memtest_vulkan is also licensed under the [zlib License](licenses/zlib-original.txt).
 
 The `memtest_vulkan` itself was developed by [GpuZelenograd repair center](https://gpuzelenograd.github.io/README?memtest_vulkan)
+
+# License
+Copyright (C) 2026 SadCryingDuck
+
+This project is licensed under the [GNU General Public License](LICENSE), version 3 or (at your option) any later version. This covers the whole project from this fork's first commit on.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+It is based on memtest_vulkan by GpuZelenograd, released under the zlib License, which allows this. The original zlib notice is kept unchanged in [licenses/zlib-original.txt](licenses/zlib-original.txt).
