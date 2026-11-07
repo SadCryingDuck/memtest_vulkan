@@ -100,6 +100,9 @@ pub fn setup_handler_impl() {
         1
     }
     unsafe {
+        // Ctrl+C may be disabled for this process if the program that started it ignores Ctrl+C
+        // (the setting is inherited): re-enable it, or Ctrl+C couldn't stop the test
+        Console::SetConsoleCtrlHandler(None, 0);
         Console::SetConsoleCtrlHandler(Some(os_handler), 1);
     }
 }
