@@ -128,7 +128,11 @@ impl NamedComputeDevice {
                 limited_by_system_memory = limited_here;
             }
         }
-        if limited_by_system_memory && let Some(memory) = system_memory {
+        // explain the limit, unless the user chose the size anyway
+        if limited_by_system_memory
+            && env.options.size.is_none()
+            && let Some(memory) = system_memory
+        {
             let _ = writeln!(
                 log_dupler,
                 "Integrated GPU: testing up to {:.1}GB of system RAM, leaving {:.1}GB for the system\n\
