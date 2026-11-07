@@ -8,10 +8,9 @@ version = '0.9.1-custom'
 rust-version = "1.89"
 
 [dependencies]
-byte-strings = '0.3.1'
 mortal = { git = 'https://github.com/GpuZelenograd/mortal.git', tag = '2025-windows-sys-migration' }
-chrono = '0.4.42'
-hhmmss = '0.1.0'
+# only formats the log timestamps: no time zone or clock support needed
+chrono = { version = '0.4.45', default-features = false, features = ['std'] }
 
 [features]
 verbose = []
@@ -24,7 +23,7 @@ version = '0.61.2'
 [target.'cfg(unix)'.dependencies.nix]
 default-features = false
 features = ['signal']
-version = '0.30.1'
+version = '0.31.3'
 
 
 [dependencies.libloading]

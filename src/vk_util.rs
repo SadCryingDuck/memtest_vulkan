@@ -1,7 +1,7 @@
 //! Vulkan helpers: error conversion and validation-layer plumbing.
 
 use crate::{ProcessEnv, close, display_this_process_result};
-use byte_strings::c_str;
+
 use erupt::vk;
 use std::ffi::{CStr, c_void};
 
@@ -18,7 +18,7 @@ impl<const N: usize> core::ops::Deref for CStrStaticPtr<N> {
 unsafe impl<const N: usize> Sync for CStrStaticPtr<N> {}
 
 pub const VK_LOADER_DEBUG: &str = "VK_LOADER_DEBUG";
-const LAYER_KHRONOS_VALIDATION: &CStr = c_str!("VK_LAYER_KHRONOS_validation");
+const LAYER_KHRONOS_VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
 pub static LAYER_KHRONOS_VALIDATION_ARRAY: CStrStaticPtr<1> =
     CStrStaticPtr([LAYER_KHRONOS_VALIDATION.as_ptr()]);
 

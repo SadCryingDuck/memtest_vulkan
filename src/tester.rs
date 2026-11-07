@@ -16,7 +16,7 @@ use crate::{
     },
     vk_util::{MapErrRetryWithLowerMemory, MapErrStr, NO_EXTENSIONS_ARRAY},
 };
-use byte_strings::c_str;
+
 use core::cmp::{max, min};
 use erupt::{DeviceLoader, vk};
 use std::{
@@ -672,12 +672,7 @@ pub fn prepare_and_test_device<Writer: std::io::Write>(
     let shader_mod =
         unsafe { device.create_shader_module(&create_info, None) }.unwrap_or_display(env);
 
-    let pipeline_infos = [
-        c_str!("read"),
-        c_str!("write"),
-        c_str!("emulate_write_bugs"),
-    ]
-    .map(|name| {
+    let pipeline_infos = [c"read", c"write", c"emulate_write_bugs"].map(|name| {
         let shader_stage = vk::PipelineShaderStageCreateInfoBuilder::new()
             .stage(vk::ShaderStageFlagBits::COMPUTE)
             .module(shader_mod)
