@@ -36,6 +36,24 @@ jobs:
       - run: cargo clippy --all --all-targets --locked -- -D warnings
       - run: cargo test --all --locked
 
+  # The end-to-end checks in tests/gpu.rs need a Vulkan device. CI machines have no GPU, so this
+  # runs them on Mesa's software Vulkan driver (lavapipe), which runs the shaders on the CPU:
+  # it checks the program's logic and the shader's error detection, not real VRAM.
+  gpu-checks:
+    name: gpu checks (software Vulkan)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the Vulkan loader and lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libvulkan1 mesa-vulkan-drivers
+      - uses: Swatinem/rust-cache@v2
+      - name: GPU checks
+        env:
+          MEMTEST_CHECK_SECONDS: '6'
+        run: cargo test --release --locked --test gpu -- --ignored --test-threads=1
+
   build:
     name: build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
