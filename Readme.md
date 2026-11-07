@@ -13,7 +13,9 @@ Requires system-provided vulkan loader and driver supporting Vulkan 1.1 (already
 ### [**<kbd>📥</kbd>** Get .exe from latest release](https://github.com/SadCryingDuck/memtest_vulkan/releases/latest)
 GitHub users also may want to try [CI build artifacts](https://github.com/SadCryingDuck/memtest_vulkan/actions) (only last 3 months kept).
 
-Start test by double-clicking the utility, no installation / parameters / configuration / admin-rights required.
+Start test by double-clicking the utility, no installation / parameters / configuration / admin-rights required. The test starts by itself after a short countdown. Before that, you can type the number of the GPU to test, or press S to open the settings: G changes the GPU, D the duration (from a 1-minute check to an endless test), M the amount of memory and E stops the test at the first error, which is handy when tuning an overclock. Enter starts the test, Esc quits.
+
+While testing, a progress line shows the time, a progress bar, the speed and the errors found so far. At the first error the console beeps and its taskbar button flashes, so errors get noticed even in a minimized window. The summary at the end says what to do next.
 ![WindowsScreenshot](.github/memtest_vulkan_windows_rtx2070.png)
 
 Any found errors are immediately reported with a multi-line details. Detailed descriptions given below may help in advanced cases, but most of the time it's enough just check if errors are absent or present
@@ -71,11 +73,12 @@ All options are optional, `memtest_vulkan --help` lists them:
 | `-t, --duration <TIME>` | How long to test, like `30s`, `10m`, `2h` or `endless` (default: `5m`, the standard test) |
 | `-w, --window-mb <MB>` | Limit one test window to MB megabytes (128MB steps), to tell driver problems from memory errors |
 | `--log <FILE>`, `--no-log` | Log file location (default: `memtest_vulkan.log` in the current folder), or no log |
+| `-e, --stop-on-error` | End the test at the first error, like when tuning an overclock |
 | `-l, --list` | List the GPUs and exit |
 | `-b, --batch` | No prompts and no key press at the end, for scripts |
 | `-v, --verbose` | Print diagnostic information (renaming the executable to `memtest_vulkan_verbose` works too) |
 
-Press Ctrl+C once to stop testing and show the results, twice to quit at once. A test stopped after the standard 5 minutes still counts as complete.
+Press Ctrl+C once to stop testing and show the results, twice to quit at once. A test stopped after the standard 5 minutes still counts as complete. With `--device` or `--batch` the start screen is skipped, so scripts start testing at once.
 
 The exit code tells the result, which is useful in scripts (`memtest_vulkan --batch --duration 1h`):
 
@@ -85,7 +88,7 @@ The exit code tells the result, which is useful in scripts (`memtest_vulkan --ba
 | 1 | memory errors found |
 | 2 | results invalid: test writes didn't reach the memory (likely a driver problem, see [Troubleshooting](#troubleshooting)) |
 | 3 | the test couldn't run, or stopped because of a runtime error |
-| 4 | stopped before the test duration ended, no errors so far |
+| 4 | stopped before the test duration ended (or cancelled at the start screen), no errors so far |
 
 The older form `memtest_vulkan <device> [<bytes>]` still works and tests without a time limit.
 
