@@ -15,11 +15,11 @@ use crate::{
         WG_SIZE, WRITE_MARKER,
     },
     text,
-    vk_util::{MapErrRetryWithLowerMemory, MapErrStr, NO_EXTENSIONS_ARRAY},
+    vk_util::{MapErrRetryWithLowerMemory, MapErrStr},
 };
 
+use ash::vk;
 use core::cmp::{max, min};
-use erupt::{DeviceLoader, vk};
 use std::{
     env,
     error::Error,
@@ -100,11 +100,11 @@ impl ReadMode {
 
 /// GPU objects used to run the test passes
 struct Tester<'a> {
-    device: &'a DeviceLoader,
+    device: &'a ash::Device,
     env: &'a ProcessEnv,
     queue: vk::Queue,
     cmd_buf: vk::CommandBuffer,
-    desc_sets: erupt::SmallVec<vk::DescriptorSet>,
+    desc_sets: Vec<vk::DescriptorSet>,
     pipeline_layout: vk::PipelineLayout,
     pipelines: ComputePipelines,
     fence: vk::Fence,
@@ -132,17 +132,17 @@ impl Drop for Tester<'_> {
 impl<'a> Tester<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new<Writer: std::io::Write>(
-        device: &'a DeviceLoader,
+        device: &'a ash::Device,
         env: &'a ProcessEnv,
         queue: vk::Queue,
         cmd_buf: vk::CommandBuffer,
-        desc_sets: erupt::SmallVec<vk::DescriptorSet>,
+        desc_sets: Vec<vk::DescriptorSet>,
         pipeline_layout: vk::PipelineLayout,
         pipelines: ComputePipelines,
         memory_props: &vk::PhysicalDeviceMemoryProperties,
         log_dupler: &mut output::LogDupler<Writer>,
     ) -> BoxResult<Self> {
-        let io_buffer_create_info = vk::BufferCreateInfoBuilder::new()
+        let io_buffer_create_info = vk::BufferCreateInfo::default()
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
             .size(mem::size_of::<IOBuf>() as vk::DeviceSize);
@@ -181,7 +181,7 @@ impl<'a> Tester<'a> {
                     [memory_props.memory_types[io_mem_index as usize].heap_index as usize]
             );
         }
-        let io_memory_allocate_info = vk::MemoryAllocateInfoBuilder::new()
+        let io_memory_allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(io_mem_reqs.size)
             .memory_type_index(io_mem_index);
         let io_memory =
@@ -195,11 +195,11 @@ impl<'a> Tester<'a> {
             .err_as_str_context("bind_buffer_memory")?;
         unsafe {
             device.update_descriptor_sets(
-                &[vk::WriteDescriptorSetBuilder::new()
+                &[vk::WriteDescriptorSet::default()
                     .dst_set(desc_sets[0])
                     .dst_binding(0)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
+                    .buffer_info(&[vk::DescriptorBufferInfo::default()
                         .buffer(io_buffer)
                         .offset(0)
                         .range(vk::WHOLE_SIZE)])],
@@ -302,7 +302,7 @@ impl<'a> Tester<'a> {
             .and_then(|text| crate::cli::parse_size(&text).ok())
             && total > limit
         {
-            erupt::utils::VulkanResult::new(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY, ())
+            Err::<(), _>(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
                 .err_retry_with_lower_memory(self.env, "allocate_memory (emulated limit)")?;
         }
         let count = max(
@@ -321,7 +321,7 @@ impl<'a> Tester<'a> {
             }
             .err_retry_with_lower_memory(self.env, "create_buffer")?;
             let buffer_reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-            let allocate_info = vk::MemoryAllocateInfoBuilder::new()
+            let allocate_info = vk::MemoryAllocateInfo::default()
                 .allocation_size(buffer_reqs.size)
                 .memory_type_index(self.test_mem_index);
             let memory = match unsafe { self.device.allocate_memory(&allocate_info, None) }
@@ -368,11 +368,11 @@ impl<'a> Tester<'a> {
         let start = Instant::now();
         unsafe {
             device.update_descriptor_sets(
-                &[vk::WriteDescriptorSetBuilder::new()
+                &[vk::WriteDescriptorSet::default()
                     .dst_set(self.desc_sets[0])
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
+                    .buffer_info(&[vk::DescriptorBufferInfo::default()
                         .buffer(buffer)
                         .offset(0)
                         .range(self.window_size as u64)])],
@@ -390,7 +390,7 @@ impl<'a> Tester<'a> {
                     vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
-                    &[vk::MemoryBarrierBuilder::new()
+                    &[vk::MemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                         .dst_access_mask(
                             vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
@@ -424,7 +424,7 @@ impl<'a> Tester<'a> {
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
-                &[vk::MemoryBarrierBuilder::new()
+                &[vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::HOST_READ)],
                 &[],
@@ -434,16 +434,20 @@ impl<'a> Tester<'a> {
                 .end_command_buffer(cmd_buf)
                 .err_retry_with_lower_memory(env, "end_command_buffer")?;
             let cmd_bufs = [cmd_buf];
-            let submit_info = &[vk::SubmitInfoBuilder::new().command_buffers(&cmd_bufs)];
+            let submit_info = &[vk::SubmitInfo::default().command_buffers(&cmd_bufs)];
             device
                 .queue_submit(self.queue, submit_info, self.fence)
                 .err_retry_with_lower_memory(env, "queue_submit")?;
             // wait in slices, so a GPU hang gets reported instead of waiting forever
             loop {
-                let waited = device.wait_for_fences(&[self.fence], true, FENCE_WAIT_SLICE_NS);
-                if waited.raw != vk::Result::TIMEOUT {
-                    waited.err_retry_with_lower_memory(env, "wait_for_fences")?;
-                    break;
+                // ash reports a wait that timed out as Err(TIMEOUT): that's not a failure,
+                // just the end of one wait slice
+                match device.wait_for_fences(&[self.fence], true, FENCE_WAIT_SLICE_NS) {
+                    Err(vk::Result::TIMEOUT) => {}
+                    waited => {
+                        waited.err_retry_with_lower_memory(env, "wait_for_fences")?;
+                        break;
+                    }
                 }
                 if start.elapsed() > PASS_HANG_TIMEOUT {
                     return Err(format!(
@@ -543,8 +547,8 @@ impl<'a> Tester<'a> {
     }
 }
 
-fn test_buffer_create_info(size: i64) -> vk::BufferCreateInfoBuilder<'static> {
-    vk::BufferCreateInfoBuilder::new()
+fn test_buffer_create_info(size: i64) -> vk::BufferCreateInfo<'static> {
+    vk::BufferCreateInfo::default()
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         // TRANSFER_DST: windows are filled with WRITE_MARKER before their first write
         .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
@@ -602,97 +606,94 @@ struct RunReport {
 
 /// Sets up the device and runs the test on it; never returns
 pub fn prepare_and_test_device<Writer: std::io::Write>(
-    instance: &erupt::InstanceLoader,
+    instance: &ash::Instance,
     selected: &NamedComputeDevice,
     env: &ProcessEnv,
     log_dupler: &mut output::LogDupler<Writer>,
 ) -> ! {
     let queue_create_info = vec![
-        vk::DeviceQueueCreateInfoBuilder::new()
+        vk::DeviceQueueCreateInfo::default()
             .queue_family_index(selected.queue_family_index)
             .queue_priorities(&[1.0]),
     ];
 
-    let device_create_info = vk::DeviceCreateInfoBuilder::new()
-        .enabled_extension_names(&*NO_EXTENSIONS_ARRAY)
-        .queue_create_infos(&queue_create_info);
+    let device_create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_create_info);
 
     let device =
-        match unsafe { DeviceLoader::new(instance, selected.physical_device, &device_create_info) }
-        {
-            Ok(device) => device,
-            Err(e) => display_this_process_result(Some(e.into()), env),
-        };
+        unsafe { instance.create_device(selected.physical_device, &device_create_info, None) }
+            .unwrap_or_display(env);
     let queue = unsafe { device.get_device_queue(selected.queue_family_index, 0) };
 
-    let cmd_pool_info = vk::CommandPoolCreateInfoBuilder::new()
+    let cmd_pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(selected.queue_family_index)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     let cmd_pool =
         unsafe { device.create_command_pool(&cmd_pool_info, None) }.unwrap_or_display(env);
 
-    let cmd_buf_info = vk::CommandBufferAllocateInfoBuilder::new()
+    let cmd_buf_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(cmd_pool)
         .command_buffer_count(1)
         .level(vk::CommandBufferLevel::PRIMARY);
     let cmd_bufs = unsafe { device.allocate_command_buffers(&cmd_buf_info) }.unwrap_or_display(env);
 
-    let desc_pool_sizes = &[vk::DescriptorPoolSizeBuilder::new()
+    let desc_pool_sizes = &[vk::DescriptorPoolSize::default()
         .descriptor_count(2)
-        ._type(vk::DescriptorType::STORAGE_BUFFER)];
-    let desc_pool_info = vk::DescriptorPoolCreateInfoBuilder::new()
+        .ty(vk::DescriptorType::STORAGE_BUFFER)];
+    let desc_pool_info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(desc_pool_sizes)
         .max_sets(1);
     let desc_pool =
         unsafe { device.create_descriptor_pool(&desc_pool_info, None) }.unwrap_or_display(env);
 
     let desc_layout_bindings = &[
-        vk::DescriptorSetLayoutBindingBuilder::new()
+        vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_count(1)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        vk::DescriptorSetLayoutBindingBuilder::new()
+        vk::DescriptorSetLayoutBinding::default()
             .binding(1)
             .descriptor_count(1)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
     let desc_layout_info =
-        vk::DescriptorSetLayoutCreateInfoBuilder::new().bindings(desc_layout_bindings);
+        vk::DescriptorSetLayoutCreateInfo::default().bindings(desc_layout_bindings);
     let desc_layouts = [
         unsafe { device.create_descriptor_set_layout(&desc_layout_info, None) }
             .unwrap_or_display(env),
     ];
 
-    let desc_info = vk::DescriptorSetAllocateInfoBuilder::new()
+    let desc_info = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(desc_pool)
         .set_layouts(&desc_layouts);
     let desc_sets = unsafe { device.allocate_descriptor_sets(&desc_info) }.unwrap_or_display(env);
 
-    let pipeline_layout_info =
-        vk::PipelineLayoutCreateInfoBuilder::new().set_layouts(&desc_layouts);
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&desc_layouts);
     let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) }
         .unwrap_or_display(env);
 
     let spv_code = Vec::from(READ_SHADER);
-    let create_info = vk::ShaderModuleCreateInfoBuilder::new().code(&spv_code);
+    let create_info = vk::ShaderModuleCreateInfo::default().code(&spv_code);
     let shader_mod =
         unsafe { device.create_shader_module(&create_info, None) }.unwrap_or_display(env);
 
     let pipeline_infos = [c"read", c"write", c"emulate_write_bugs"].map(|name| {
-        let shader_stage = vk::PipelineShaderStageCreateInfoBuilder::new()
-            .stage(vk::ShaderStageFlagBits::COMPUTE)
+        let shader_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_mod)
             .name(name);
-        vk::ComputePipelineCreateInfoBuilder::new()
+        vk::ComputePipelineCreateInfo::default()
             .layout(pipeline_layout)
-            .stage(*shader_stage)
+            .stage(shader_stage)
     });
 
-    let pipelines =
-        unsafe { device.create_compute_pipelines(Default::default(), &pipeline_infos, None) }
-            .unwrap_or_display(env);
+    // on failure ash returns the pipelines that were created too: only the error matters here
+    let pipelines = unsafe {
+        device.create_compute_pipelines(vk::PipelineCache::null(), &pipeline_infos, None)
+    }
+    .map_err(|(_, error)| error)
+    .unwrap_or_display(env);
     let pipelines = ComputePipelines {
         read: pipelines[0],
         write: pipelines[1],

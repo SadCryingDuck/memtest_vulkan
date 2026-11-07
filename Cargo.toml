@@ -28,14 +28,10 @@ features = ['signal']
 version = '0.31.3'
 
 
-[dependencies.libloading]
-default-features = false
-version = '0.9.0'
-
-
-[dependencies.erupt]
-default-features = false
-version = '0.23'
+# Vulkan bindings. Default features: "loaded" loads the system's Vulkan loader library at
+# runtime, "debug" formats Vulkan structures in the verbose output
+[dependencies.ash]
+version = '0.38.0'
 
 [dependencies.memtest_vulkan_build]
 path = './memtest_vulkan_build'

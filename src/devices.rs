@@ -1,21 +1,12 @@
 //! Finding Vulkan devices able to run the test, and their properties.
 
 use crate::{
-    ProcessEnv,
-    erupt_vendored_utils_loading::{EntryLoader, new_loader},
-    output, ram,
+    ProcessEnv, output, ram,
     shader::{GB, TEST_DATA_KEEP_FREE},
-    vk_util::{
-        LAYER_KHRONOS_VALIDATION_ARRAY, MapErrStr, NO_EXTENSIONS_ARRAY, VK_LOADER_DEBUG,
-        debug_callback,
-    },
+    vk_util::{LAYER_KHRONOS_VALIDATION, MapErrStr, VK_LOADER_DEBUG, debug_callback, load_vulkan},
 };
+use ash::vk;
 use core::cmp::{max, min};
-use erupt::{
-    ExtendableFrom, InstanceLoader, ObjectHandle,
-    extensions::{ext_debug_utils, ext_memory_budget, ext_pci_bus_info, khr_maintenance4},
-    vk,
-};
 use std::{env, ffi::CStr, fmt, io::Write};
 
 #[derive(Default)]
@@ -52,6 +43,13 @@ pub struct DeviceSizeLimits {
     pub max_buffer_size: Option<i64>,
 }
 
+/// What VK_EXT_memory_budget reported per memory heap (zeros if it isn't supported)
+#[derive(Clone, Copy, Default)]
+pub struct MemoryBudget {
+    pub heap_budget: [u64; vk::MAX_MEMORY_HEAPS],
+    pub heap_usage: [u64; vk::MAX_MEMORY_HEAPS],
+}
+
 pub struct NamedComputeDevice {
     /// Name, memory size and type, shown in the list after the GPU number
     pub label: String,
@@ -59,7 +57,7 @@ pub struct NamedComputeDevice {
     pub queue_family_index: u32,
     pub physical_props: vk::PhysicalDeviceProperties,
     pub memory_props: vk::PhysicalDeviceMemoryProperties,
-    pub budget_props: ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXT,
+    pub budget_props: MemoryBudget,
     pub index_in_device_iteration: usize,
     pub size_limits: DeviceSizeLimits,
 }
@@ -129,13 +127,18 @@ impl NamedComputeDevice {
     ) -> i64 {
         if env.verbose() {
             for i in 0..self.memory_props.memory_heap_count as usize {
+                let flags = self.memory_props.memory_heaps[i].flags;
+                let flags = if flags.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    format!("{flags:?}")
+                };
                 let _ = writeln!(
                     log_dupler,
-                    "heap size {:4.1}GB budget {:4.1}GB usage {:4.1}GB flags={:#?}",
+                    "heap size {:4.1}GB budget {:4.1}GB usage {:4.1}GB flags={flags}",
                     self.memory_props.memory_heaps[i].size as f32 / GB,
                     self.budget_props.heap_budget[i] as f32 / GB,
                     self.budget_props.heap_usage[i] as f32 / GB,
-                    self.memory_props.memory_heaps[i].flags,
                 );
             }
         }
@@ -162,105 +165,88 @@ impl NamedComputeDevice {
     }
 }
 
+/// The debug messenger printing validation layer messages, and its extension loader
+type DebugMessenger = (ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT);
+
 fn load_instance<Writer: std::io::Write>(
     env: &ProcessEnv,
     log_dupler: &mut output::LogDupler<Writer>,
-) -> Result<
-    (
-        erupt::InstanceLoader,
-        EntryLoader,
-        vk::DebugUtilsMessengerEXT,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(ash::Entry, ash::Instance, Option<DebugMessenger>), Box<dyn std::error::Error>> {
     let override_vk_loader_debug = env::var_os(VK_LOADER_DEBUG).is_none();
     if env.verbose() && override_vk_loader_debug {
         // memtest_vulkan is single-threaded during init.
         unsafe { env::set_var(VK_LOADER_DEBUG, "error,warn") };
     }
 
-    let mut entry = new_loader()?;
+    let mut entry = load_vulkan()?;
     if env.verbose() {
+        let version = unsafe { entry.try_enumerate_instance_version() }
+            .ok()
+            .flatten()
+            .unwrap_or(vk::API_VERSION_1_0);
         let _ = writeln!(
             log_dupler,
             "Verbose mode. Vulkan loader {}.{}.{}",
-            vk::api_version_major(entry.instance_version()),
-            vk::api_version_minor(entry.instance_version()),
-            vk::api_version_patch(entry.instance_version())
+            vk::api_version_major(version),
+            vk::api_version_minor(version),
+            vk::api_version_patch(version)
         );
-        for (idx, prop) in unsafe { entry.enumerate_instance_layer_properties(None) }
-            .err_as_str()
-            .unwrap_or_default()
+        let layers = unsafe { entry.enumerate_instance_layer_properties() }.unwrap_or_default();
+        let names: Vec<String> = layers
             .iter()
-            .enumerate()
-        {
-            if idx == 0 {
-                let _ = write!(log_dupler, "Layers: ");
-            } else {
-                let _ = write!(log_dupler, ", ");
-            }
-
-            let _ = write!(log_dupler, "{}", unsafe {
-                CStr::from_ptr(prop.layer_name.as_ptr())
-                    .to_str()
-                    .unwrap_or("Invalid property_name")
-            });
-        }
-        let _ = writeln!(log_dupler);
-        for (idx, ext) in unsafe { entry.enumerate_instance_extension_properties(None, None) }
-            .err_as_str()
-            .unwrap_or_default()
+            .map(|layer| {
+                layer
+                    .layer_name_as_c_str()
+                    .map_or("?".into(), |name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        let _ = writeln!(log_dupler, "Layers: {}", names.join(", "));
+        let extensions =
+            unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+        let names: Vec<String> = extensions
             .iter()
-            .enumerate()
-        {
-            if idx == 0 {
-                let _ = write!(log_dupler, "Extensions: ");
-            } else {
-                let _ = write!(log_dupler, ", ");
-            }
-
-            let _ = write!(log_dupler, "{}", unsafe {
-                CStr::from_ptr(ext.extension_name.as_ptr())
-                    .to_str()
-                    .unwrap_or("Invalid extension_name")
-            });
-        }
-        let _ = writeln!(log_dupler);
+            .map(|ext| {
+                ext.extension_name_as_c_str()
+                    .map_or("?".into(), |name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        let _ = writeln!(log_dupler, "Extensions: {}", names.join(", "));
         let _ = writeln!(log_dupler);
     }
 
-    let instance_extensions = vec![ext_debug_utils::EXT_DEBUG_UTILS_EXTENSION_NAME];
-
-    let app_info = vk::ApplicationInfoBuilder::new().api_version(vk::API_VERSION_1_1);
-    let instance_create_info = vk::InstanceCreateInfoBuilder::new()
+    let instance_extensions = [ash::ext::debug_utils::NAME.as_ptr()];
+    let layers = [LAYER_KHRONOS_VALIDATION.as_ptr()];
+    let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+    let instance_create_info = vk::InstanceCreateInfo::default()
         .enabled_extension_names(&instance_extensions)
-        .enabled_layer_names(&*LAYER_KHRONOS_VALIDATION_ARRAY)
+        .enabled_layer_names(&layers)
         .application_info(&app_info);
 
-    let mut messenger = vk::DebugUtilsMessengerEXT::null();
-    match unsafe {
-        InstanceLoader::new(&entry, &instance_create_info)
-            .err_as_str_context("instance with validation")
-    } {
-        Ok(instance_with_validation) => {
-            let mut severity = ext_debug_utils::DebugUtilsMessageSeverityFlagsEXT::WARNING_EXT
-                | ext_debug_utils::DebugUtilsMessageSeverityFlagsEXT::ERROR_EXT;
+    match unsafe { entry.create_instance(&instance_create_info, None) }
+        .err_as_str_context("instance with validation")
+    {
+        Ok(instance) => {
+            let mut severity = vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR;
             if env.verbose() {
-                severity |= ext_debug_utils::DebugUtilsMessageSeverityFlagsEXT::INFO_EXT;
+                severity |= vk::DebugUtilsMessageSeverityFlagsEXT::INFO;
                 //lists all extensions, very verbose
-                //severity |= ext_debug_utils::DebugUtilsMessageSeverityFlagsEXT::VERBOSE_EXT;
+                //severity |= vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE;
                 let _ = writeln!(log_dupler, "DebugUtilsMessenger with seveity {severity:?}");
             }
-            let create_info = ext_debug_utils::DebugUtilsMessengerCreateInfoEXTBuilder::new()
+            let create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
                 .message_severity(severity)
-                .message_type(ext_debug_utils::DebugUtilsMessageTypeFlagsEXT::all())
+                .message_type(
+                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                )
                 .pfn_user_callback(Some(debug_callback));
-            messenger = unsafe {
-                instance_with_validation.create_debug_utils_messenger_ext(&create_info, None)
-            }
-            .result()
-            .unwrap_or_default();
-            return Ok((instance_with_validation, entry, messenger));
+            let debug_utils = ash::ext::debug_utils::Instance::new(&entry, &instance);
+            let messenger = unsafe { debug_utils.create_debug_utils_messenger(&create_info, None) }
+                .ok()
+                .map(|messenger| (debug_utils, messenger));
+            return Ok((entry, instance, messenger));
         }
         Err(e) => {
             if env.verbose() {
@@ -270,17 +256,11 @@ fn load_instance<Writer: std::io::Write>(
     }
 
     //fallback creation without validation and extensions
-    let simple_instance_try = unsafe {
-        InstanceLoader::new(
-            &entry,
-            &vk::InstanceCreateInfoBuilder::new()
-                .enabled_extension_names(&*NO_EXTENSIONS_ARRAY)
-                .application_info(&app_info),
-        )
-    }
-    .err_as_str_context("instance. Try specifying icd.json via VK_DRIVER_FILES env var");
+    let simple_create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+    let simple_instance_try = unsafe { entry.create_instance(&simple_create_info, None) }
+        .err_as_str_context("instance. Try specifying icd.json via VK_DRIVER_FILES env var");
     match simple_instance_try {
-        Ok(instance) => Ok((instance, entry, messenger)),
+        Ok(instance) => Ok((entry, instance, None)),
         Err(e) => {
             if !override_vk_loader_debug {
                 return Err(e);
@@ -289,45 +269,36 @@ fn load_instance<Writer: std::io::Write>(
             //retry instance creation with loader debug enabled
             // memtest_vulkan is single-threaded during init.
             unsafe { env::set_var(VK_LOADER_DEBUG, "all") };
-            entry = new_loader()?;
-            let debug_instance_try = unsafe {
-                InstanceLoader::new(
-                    &entry,
-                    &vk::InstanceCreateInfoBuilder::new().application_info(&app_info),
-                )
-            }
-            .map_err(|_second_error_ignired| e)?;
-            Ok((debug_instance_try, entry, messenger))
+            entry = load_vulkan()?;
+            let debug_instance_try = unsafe { entry.create_instance(&simple_create_info, None) }
+                .map_err(|_second_error_ignired| e)?;
+            Ok((entry, debug_instance_try, None))
         }
     }
 }
 
 pub struct LoadedDevices {
-    // use Option to enforce InstanceLoader must be dropped before EntryLoader inside Drop implementation;
-    // outside Drop theay are always Some
-    instance: Option<erupt::InstanceLoader>,
-    entry: Option<EntryLoader>,
-    messenger: vk::DebugUtilsMessengerEXT,
+    // keeps the Vulkan loader library loaded; dropped after Drop destroyed the instance
+    _entry: ash::Entry,
+    instance: ash::Instance,
+    debug_messenger: Option<DebugMessenger>,
     pub devices: Vec<NamedComputeDevice>,
 }
 
 impl LoadedDevices {
-    pub fn instance(&self) -> &erupt::InstanceLoader {
-        self.instance.as_ref().unwrap()
+    pub fn instance(&self) -> &ash::Instance {
+        &self.instance
     }
 }
 
 impl Drop for LoadedDevices {
     fn drop(&mut self) {
         unsafe {
-            if !self.messenger.is_null() {
-                self.instance()
-                    .destroy_debug_utils_messenger_ext(self.messenger, None);
+            if let Some((debug_utils, messenger)) = self.debug_messenger.take() {
+                debug_utils.destroy_debug_utils_messenger(messenger, None);
             }
-            self.instance().destroy_instance(None);
+            self.instance.destroy_instance(None);
         }
-        self.instance = None;
-        self.entry = None;
     }
 }
 
@@ -338,19 +309,19 @@ struct Candidate {
     properties: vk::PhysicalDeviceProperties,
     pci_bus: Option<(u32, u32)>,
     memory_props: vk::PhysicalDeviceMemoryProperties,
-    budget_props: ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXT,
+    budget_props: MemoryBudget,
     index_in_device_iteration: usize,
     size_limits: DeviceSizeLimits,
 }
 
 /// Queries one physical device; None if it can't run compute shaders
 unsafe fn query_candidate(
-    instance: &InstanceLoader,
+    instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     index_in_device_iteration: usize,
 ) -> Option<Candidate> {
     let queue_family_index =
-        unsafe { instance.get_physical_device_queue_family_properties(physical_device, None) }
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
             .into_iter()
             .position(|properties| properties.queue_flags.contains(vk::QueueFlags::COMPUTE))?
             as u32;
@@ -358,20 +329,18 @@ unsafe fn query_candidate(
     // Only chain extension structures the device supports: passing structures of
     // unsupported extensions in pNext is invalid usage per the Vulkan spec.
     let device_extensions =
-        unsafe { instance.enumerate_device_extension_properties(physical_device, None, None) }
-            .result()
+        unsafe { instance.enumerate_device_extension_properties(physical_device) }
             .unwrap_or_default();
-    let has_extension = |name: *const std::os::raw::c_char| {
-        let wanted = unsafe { CStr::from_ptr(name) };
+    let has_extension = |wanted: &CStr| {
         device_extensions
             .iter()
-            .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == wanted)
+            .any(|ext| ext.extension_name_as_c_str() == Ok(wanted))
     };
-    let has_pci_bus_info = has_extension(ext_pci_bus_info::EXT_PCI_BUS_INFO_EXTENSION_NAME);
-    let has_memory_budget_ext = has_extension(ext_memory_budget::EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    let has_pci_bus_info = has_extension(ash::ext::pci_bus_info::NAME);
+    let has_memory_budget_ext = has_extension(ash::ext::memory_budget::NAME);
     // maxBufferSize: the instance is created for Vulkan 1.1, so using the 1.3 core
     // structure is only valid when the device exposes it as VK_KHR_maintenance4
-    let has_maintenance4 = has_extension(khr_maintenance4::KHR_MAINTENANCE_4_EXTENSION_NAME);
+    let has_maintenance4 = has_extension(ash::khr::maintenance4::NAME);
 
     let mut properties = unsafe { instance.get_physical_device_properties(physical_device) };
     let effective_version = (
@@ -379,38 +348,40 @@ unsafe fn query_candidate(
         vk::api_version_minor(properties.api_version),
     );
 
-    let mut pci_structure_request =
-        ext_pci_bus_info::PhysicalDevicePCIBusInfoPropertiesEXTBuilder::new();
-    let mut budget_request =
-        ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXTBuilder::new();
-    let mut maintenance3_request = vk::PhysicalDeviceMaintenance3PropertiesBuilder::new();
-    let mut maintenance4_request = vk::PhysicalDeviceMaintenance4PropertiesBuilder::new();
+    let mut pci_bus_info = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
+    let mut maintenance4 = vk::PhysicalDeviceMaintenance4Properties::default();
     let mut size_limits = DeviceSizeLimits::default();
 
     //older vulkan implementations like broadcom on RaspberryPi lacks vk_1_1 support even if application requested it
     let is_vk_1_1 = effective_version >= (1, 1);
     let memory_props = if is_vk_1_1 {
-        // maxMemoryAllocationSize is Vulkan 1.1 core
-        let mut device_props2 =
-            vk::PhysicalDeviceProperties2Builder::new().extend_from(&mut maintenance3_request);
-        if has_pci_bus_info {
-            device_props2 = device_props2.extend_from(&mut pci_structure_request);
+        {
+            // maxMemoryAllocationSize is Vulkan 1.1 core. The chained structures stay borrowed
+            // until device_props2 goes away at the end of this block.
+            let mut device_props2 =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance3);
+            if has_pci_bus_info {
+                device_props2 = device_props2.push_next(&mut pci_bus_info);
+            }
+            if has_maintenance4 {
+                device_props2 = device_props2.push_next(&mut maintenance4);
+            }
+            unsafe {
+                instance.get_physical_device_properties2(physical_device, &mut device_props2)
+            };
+            properties = device_props2.properties;
         }
-        if has_maintenance4 {
-            device_props2 = device_props2.extend_from(&mut maintenance4_request);
-        }
-
-        unsafe { instance.get_physical_device_properties2(physical_device, &mut device_props2) };
-        properties = device_props2.properties;
         size_limits.max_memory_allocation_size =
-            Some(maintenance3_request.max_memory_allocation_size as i64).filter(|&size| size > 0);
+            Some(maintenance3.max_memory_allocation_size as i64).filter(|&size| size > 0);
         if has_maintenance4 {
             size_limits.max_buffer_size =
-                Some(maintenance4_request.max_buffer_size as i64).filter(|&size| size > 0);
+                Some(maintenance4.max_buffer_size as i64).filter(|&size| size > 0);
         }
-        let mut memory_props2 = vk::PhysicalDeviceMemoryProperties2Builder::new();
+        let mut memory_props2 = vk::PhysicalDeviceMemoryProperties2::default();
         if has_memory_budget_ext {
-            memory_props2 = memory_props2.extend_from(&mut budget_request);
+            memory_props2 = memory_props2.push_next(&mut budget);
         }
         unsafe {
             instance.get_physical_device_memory_properties2(physical_device, &mut memory_props2)
@@ -424,12 +395,13 @@ unsafe fn query_candidate(
         physical_device,
         queue_family_index,
         properties,
-        pci_bus: (has_pci_bus_info && is_vk_1_1).then_some((
-            pci_structure_request.pci_bus,
-            pci_structure_request.pci_device,
-        )),
+        pci_bus: (has_pci_bus_info && is_vk_1_1)
+            .then_some((pci_bus_info.pci_bus, pci_bus_info.pci_device)),
         memory_props,
-        budget_props: *budget_request,
+        budget_props: MemoryBudget {
+            heap_budget: budget.heap_budget,
+            heap_usage: budget.heap_usage,
+        },
         index_in_device_iteration,
         size_limits,
     })
@@ -441,8 +413,8 @@ pub fn list_devices_ordered_labeled_from_1<Writer: std::io::Write>(
     env: &ProcessEnv,
     log_dupler: &mut output::LogDupler<Writer>,
 ) -> Result<LoadedDevices, Box<dyn std::error::Error>> {
-    let (instance, entry, messenger) = load_instance(env, log_dupler)?;
-    let mut candidates: Vec<Candidate> = unsafe { instance.enumerate_physical_devices(None) }
+    let (entry, instance, debug_messenger) = load_instance(env, log_dupler)?;
+    let mut candidates: Vec<Candidate> = unsafe { instance.enumerate_physical_devices() }
         .err_as_str()?
         .into_iter()
         .enumerate()
@@ -516,9 +488,9 @@ pub fn list_devices_ordered_labeled_from_1<Writer: std::io::Write>(
         devices.push(device);
     }
     Ok(LoadedDevices {
-        instance: Some(instance),
-        entry: Some(entry),
-        messenger,
+        _entry: entry,
+        instance,
+        debug_messenger,
         devices,
     })
 }

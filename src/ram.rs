@@ -70,9 +70,9 @@ fn parse_meminfo(text: &str) -> Option<SystemMemory> {
 #[cfg(target_os = "linux")]
 pub fn virt_addr_details(
     #[expect(unused)] virt_addr: *const core::ffi::c_void,
-    device_type: erupt::vk::PhysicalDeviceType,
+    device_type: ash::vk::PhysicalDeviceType,
 ) -> Option<String> {
-    if device_type == erupt::vk::PhysicalDeviceType::DISCRETE_GPU {
+    if device_type == ash::vk::PhysicalDeviceType::DISCRETE_GPU {
         return None;
     }
     None
@@ -81,7 +81,7 @@ pub fn virt_addr_details(
 #[cfg(not(target_os = "linux"))]
 pub fn virt_addr_details(
     #[expect(unused)] virt_addr: *const core::ffi::c_void,
-    #[expect(unused)] device_type: erupt::vk::PhysicalDeviceType,
+    #[expect(unused)] device_type: ash::vk::PhysicalDeviceType,
 ) -> Option<String> {
     None
 }

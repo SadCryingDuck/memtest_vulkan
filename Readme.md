@@ -335,8 +335,9 @@ Similarly, `MEMTEST_VULKAN_EMULATE_SKIPPED_WRITE_ITERATION` checks the `WRITES N
 # Acknowledgements
 The idea inspired by OpenCL-based cross-platform memory testing tool [memtestCL](https://github.com/ihaque/memtestCL).
 
-The implementation would not be possible without great vulkan bindings for rust provided by zlib-licensed [erupt library](https://gitlab.com/Friz64/erupt).
+The original implementation would not be possible without great vulkan bindings for rust provided by zlib-licensed [erupt library](https://gitlab.com/Friz64/erupt).
 So, for licensing simplicity, the original memtest_vulkan is also licensed under the [zlib License](licenses/zlib-original.txt).
+Since erupt is no longer maintained, this fork uses the [ash](https://github.com/ash-rs/ash) Vulkan bindings (MIT or Apache-2.0 licensed).
 
 The `memtest_vulkan` itself was developed by [GpuZelenograd repair center](https://gpuzelenograd.github.io/README?memtest_vulkan)
 

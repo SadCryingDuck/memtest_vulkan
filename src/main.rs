@@ -8,7 +8,6 @@ mod alert;
 mod cli;
 mod close;
 mod devices;
-mod erupt_vendored_utils_loading;
 mod input;
 mod iobuf;
 mod output;
@@ -18,8 +17,6 @@ mod start_screen;
 mod tester;
 mod text;
 mod vk_util;
-
-pub use erupt::{CustomEntryLoader, LoaderError}; // republish for vendored part
 
 use devices::{LoadedDevices, NamedComputeDevice};
 use shader::{ALLOCATION_TRY_STEP, GB, MIN_WANTED_ALLOCATION};
