@@ -2,7 +2,7 @@
 edition = '2024'
 name = 'memtest_vulkan'
 # releases are tagged v<version>; the -duck suffix marks this fork's builds
-version = '0.11.1-duck'
+version = '0.11.2-duck'
 rust-version = "1.89"
 description = 'GPU video memory (VRAM) tester using Vulkan compute shaders'
 license = 'GPL-3.0-or-later'
