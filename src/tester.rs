@@ -22,7 +22,6 @@ use erupt::{DeviceLoader, vk};
 use std::{
     env,
     error::Error,
-    fmt::Write as _,
     io::Write,
     mem,
     time::{Duration, Instant},
@@ -70,6 +69,9 @@ struct ComputePipelines {
 struct TestWindow {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    /// false once dropped from the test (its memory freed); indexes of the others stay the same,
+    /// since the test pattern of a window depends on its index
+    active: bool,
 }
 
 /// Mode of a read pass, shown in error reports
@@ -254,8 +256,25 @@ impl<'a> Tester<'a> {
         })
     }
 
+    /// Count of windows still tested
     fn window_count(&self) -> i64 {
-        self.windows.len() as i64
+        self.windows.iter().filter(|window| window.active).count() as i64
+    }
+
+    fn is_active(&self, window_idx: usize) -> bool {
+        self.windows[window_idx].active
+    }
+
+    /// Frees a window and stops testing it
+    fn drop_window(&mut self, window_idx: usize) {
+        let window = &mut self.windows[window_idx];
+        if window.active {
+            window.active = false;
+            unsafe {
+                self.device.destroy_buffer(window.buffer, None);
+                self.device.free_memory(window.memory, None);
+            }
+        }
     }
 
     fn tested_bytes(&self) -> i64 {
@@ -263,7 +282,7 @@ impl<'a> Tester<'a> {
     }
 
     fn free_windows(&mut self) {
-        for window in self.windows.drain(..) {
+        for window in self.windows.drain(..).filter(|window| window.active) {
             unsafe {
                 self.device.destroy_buffer(window.buffer, None);
                 self.device.free_memory(window.memory, None);
@@ -302,7 +321,11 @@ impl<'a> Tester<'a> {
                     return Err(e);
                 }
             };
-            self.windows.push(TestWindow { buffer, memory });
+            self.windows.push(TestWindow {
+                buffer,
+                memory,
+                active: true,
+            });
             unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }
                 .err_retry_with_lower_memory(self.env, "bind_buffer_memory")?;
         }
@@ -553,6 +576,8 @@ struct RunReport {
     totals: ErrorTotals,
     last_error_at: Option<Duration>,
     swap_warning: Option<String>,
+    /// windows dropped because the driver placed them in system RAM
+    skipped_windows: Vec<usize>,
     /// tested at least the standard 5 minutes, or the shorter duration asked for
     completed: bool,
     stopped_by_user: bool,
@@ -967,8 +992,83 @@ fn error_state(totals: &ErrorTotals, last_error_at: Option<Duration>) -> String 
     }
 }
 
+/// Lists window numbers (from 1) like "2, 3"
+fn window_numbers(windows: &[usize]) -> String {
+    windows
+        .iter()
+        .map(|window_idx| (window_idx + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Which of the slow windows can be dropped: never window 0 (it holds the re-read data), and
+/// only while at least one other fast window stays for the write test
+fn windows_to_drop(slow: &[usize], active: &[bool]) -> Vec<usize> {
+    let fast_rewritten_windows = (1..active.len())
+        .filter(|window_idx| active[*window_idx] && !slow.contains(window_idx))
+        .count();
+    if fast_rewritten_windows == 0 {
+        return Vec::new();
+    }
+    slow.iter()
+        .copied()
+        .filter(|&window_idx| window_idx != 0 && active[window_idx])
+        .collect()
+}
+
+/// Drops windows the driver placed in system RAM (found by `find_slow_windows`), so the rest of
+/// the test checks VRAM only. Window 0 holds the re-read data and at least one other window is
+/// needed for the write test, so if those are slow they're kept: then returns a warning instead.
+fn handle_slow_windows<Writer: std::io::Write>(
+    tester: &mut Tester,
+    log_dupler: &mut output::LogDupler<Writer>,
+    slow: &[usize],
+    slowdown: f64,
+    skipped_windows: &mut Vec<usize>,
+) -> BoxResult<Option<String>> {
+    let total_windows = tester.windows.len();
+    let active: Vec<bool> = (0..total_windows).map(|i| tester.is_active(i)).collect();
+    let droppable = windows_to_drop(slow, &active);
+    let window_gb = tester.window_size as f32 / GB;
+    if !droppable.is_empty() {
+        for &window_idx in &droppable {
+            tester.drop_window(window_idx);
+        }
+        skipped_windows.extend(&droppable);
+        writeln!(
+            log_dupler,
+            "Test window{} {} of {total_windows} ({:.1}GB) read {slowdown:.0}x slower than the others: the driver\n\
+             placed that memory in system RAM, most likely because other programs use the VRAM.\n\
+             Testing continues without it, on {:.1}GB. Close other programs using the GPU (browsers,\n\
+             Discord, games, overlays) to test more of the VRAM.",
+            if droppable.len() > 1 { "s" } else { "" },
+            window_numbers(&droppable),
+            droppable.len() as f32 * window_gb,
+            tester.tested_bytes() as f32 / GB,
+        )?;
+    }
+    let kept: Vec<usize> = slow
+        .iter()
+        .copied()
+        .filter(|window_idx| !droppable.contains(window_idx))
+        .collect();
+    if kept.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "test window{} {} of {total_windows} ({:.1}GB) read{} {slowdown:.0}x slower than the others.\n\
+         The driver most likely placed that memory in system RAM because other programs use the\n\
+         VRAM, so that part of the test checks system RAM instead of VRAM. Close other programs\n\
+         using the GPU (browsers, Discord, games, overlays) or test less memory with --size.",
+        if kept.len() > 1 { "s" } else { "" },
+        window_numbers(&kept),
+        kept.len() as f32 * window_gb,
+        if kept.len() > 1 { "" } else { "s" },
+    )))
+}
+
 fn main_loop<Writer: std::io::Write>(
-    tester: &Tester,
+    tester: &mut Tester,
     log_dupler: &mut output::LogDupler<Writer>,
     mut totals: ErrorTotals,
     mut last_error_at: Option<Duration>,
@@ -993,6 +1093,7 @@ fn main_loop<Writer: std::io::Write>(
     let announce_standard_result = target.is_none_or(|target| target > STANDARD_DURATION);
     let mut standard_announced = false;
     let mut swap_warning: Option<String> = None;
+    let mut skipped_windows: Vec<usize> = Vec::new();
 
     let start = Instant::now();
     let mut next_report_at = Duration::ZERO;
@@ -1010,6 +1111,9 @@ fn main_loop<Writer: std::io::Write>(
     'test: for iteration in 1.. {
         // write all windows except window 0, which keeps the initial data to check retention
         for window_idx in 1..window_count {
+            if !tester.is_active(window_idx) {
+                continue;
+            }
             let write_pipeline = if skip_write_iteration == Some(iteration) && window_idx == 1 {
                 None // emulate a write that never reaches memory
             } else if iteration != emulate_write_bugs_iteration {
@@ -1053,6 +1157,9 @@ fn main_loop<Writer: std::io::Write>(
                 }
             }
             for window_idx in 0..window_count {
+                if !tester.is_active(window_idx) {
+                    continue;
+                }
                 let io_in = if window_idx == 0 {
                     // window 0 is never rewritten: check the data of the initial fill
                     let mut io = IOBuf::for_initial_iteration();
@@ -1101,34 +1208,12 @@ fn main_loop<Writer: std::io::Write>(
                 close::raise_status_bit(close::app_status::INITED_OK);
             }
             // memory placed in system RAM: some windows much slower than others
-            if swap_warning.is_none()
-                && let Some((slow, slowdown)) =
-                    find_slow_windows(&window_read_times, &window_had_errors)
+            if let Some((slow, slowdown)) =
+                find_slow_windows(&window_read_times, &window_had_errors)
+                && let Some(warning) =
+                    handle_slow_windows(tester, log_dupler, &slow, slowdown, &mut skipped_windows)?
+                && swap_warning.is_none()
             {
-                let window_gb = tester.window_size as f32 / GB;
-                let fits_gb = (window_count - slow.len()) as f32 * window_gb;
-                let first = slow[0];
-                let last = slow[slow.len() - 1];
-                let mut numbers = String::new();
-                for (i, window_idx) in slow.iter().enumerate() {
-                    let _ = write!(
-                        numbers,
-                        "{}{}",
-                        if i > 0 { ", " } else { "" },
-                        window_idx + 1
-                    );
-                }
-                let warning = format!(
-                    "test window{} {numbers} of {window_count} ({:.1}-{:.1}GB) read{} {slowdown:.0}x slower than the others.\n\
-                     The driver most likely placed that memory in system RAM because other programs use the\n\
-                     VRAM, so that part of the test checks system RAM instead of VRAM. Close other programs\n\
-                     using the GPU (browsers, Discord, games, overlays) or test less memory, like --size {:.1}G.",
-                    if slow.len() > 1 { "s" } else { "" },
-                    first as f32 * window_gb,
-                    (last + 1) as f32 * window_gb,
-                    if slow.len() > 1 { "" } else { "s" },
-                    (fits_gb * 10.0).floor() / 10.0
-                );
                 writeln!(log_dupler, "WARNING: {warning}")?;
                 swap_warning = Some(warning);
             }
@@ -1191,6 +1276,7 @@ fn main_loop<Writer: std::io::Write>(
         totals,
         last_error_at,
         swap_warning,
+        skipped_windows,
         completed: target_reached || elapsed >= required,
         stopped_by_user: stop_requested,
     })
@@ -1271,6 +1357,15 @@ fn write_summary<Writer: std::io::Write>(
     {
         writeln!(log_dupler, "Likely cause: {cause}")?;
     }
+    if !report.skipped_windows.is_empty() {
+        writeln!(
+            log_dupler,
+            "Skipped:    {:.1}GB (window {}) the driver placed in system RAM, as other programs use the VRAM.\n            \
+             Close other programs using the GPU to test it too.",
+            report.skipped_windows.len() as f32 * tester.window_size as f32 / GB,
+            window_numbers(&report.skipped_windows)
+        )?;
+    }
     if let Some(warning) = &report.swap_warning {
         writeln!(
             log_dupler,
@@ -1314,6 +1409,26 @@ mod tests {
         assert_eq!(
             find_slow_windows(&ms(&[94, 5000, 95]), &[false, true, false]),
             None
+        );
+    }
+
+    #[test]
+    fn slow_windows_are_dropped_but_window_0_kept() {
+        // on Intel Arc B580 with 10.5GB tested, window 3 of 3 was placed in system RAM
+        assert_eq!(windows_to_drop(&[2], &[true; 3]), vec![2]);
+        assert_eq!(windows_to_drop(&[1, 3], &[true; 4]), vec![1, 3]);
+        // window 0 holds the re-read data
+        assert_eq!(windows_to_drop(&[0, 2], &[true; 3]), vec![2]);
+        // at least one fast window must stay for the write test
+        assert_eq!(windows_to_drop(&[1], &[true; 2]), Vec::<usize>::new());
+        assert_eq!(
+            windows_to_drop(&[2], &[true, false, true]),
+            Vec::<usize>::new()
+        );
+        // already dropped windows aren't dropped again
+        assert_eq!(
+            windows_to_drop(&[1, 2], &[true, false, true, true]),
+            vec![2]
         );
     }
 

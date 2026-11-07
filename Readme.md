@@ -213,7 +213,7 @@ The _only_ simple thing in result interpreting - is "If some errors are reported
 
 The summary at the end of the test also gives the *likely cause* the error pattern is typical of: single-bit flips concentrated on one bit point to one faulty data line or chip, scattered single-bit flips to unstable memory (overclock, undervolt, overheating), values reading as FFFFFFFF or whole corrupted values to severe instability. These are hints based on typical patterns, not a diagnosis.
 
-If the test warns that a test window reads many times slower than the others, the driver placed that part of the test memory in system RAM, usually because other programs use the VRAM. That part of the test then checks system RAM instead of VRAM: close other programs using the GPU or test less memory with `--size`.
+If a test window reads many times slower than the others, the driver placed that part of the test memory in system RAM, usually because other programs use the VRAM. The test then drops that window and continues on the rest, so it keeps checking VRAM only; the summary shows how much was skipped. Close other programs using the GPU to test all of the memory. (The window holding the re-read data is never dropped: if it's the slow one, the test only warns that part of it checks system RAM.)
 
 Integrated GPUs use system RAM as video memory, so by default they test only the system RAM that is available, minus a reserve for the system and other programs (20% of the total RAM, at least 2GB). The amount is shown when the test starts, and `--size` changes it.
 
