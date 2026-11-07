@@ -174,11 +174,13 @@ fn gpu_failures_end_the_test_instead_of_retrying() {
 #[test]
 #[ignore = "needs a Vulkan device"]
 fn errors_found_before_a_crash_still_fail() {
+    // An iteration is 2 passes per window, so pass 400 comes well after iteration 3 even with
+    // many small windows (like lavapipe's, limited to 128MB)
     memtest(
         &["-t", "120s"],
         &[
             ("MEMTEST_VULKAN_EMULATE_WRITE_BUG_ITERATION", "3"),
-            ("MEMTEST_VULKAN_EMULATE_FAILURE", "panic:40"),
+            ("MEMTEST_VULKAN_EMULATE_FAILURE", "panic:400"),
         ],
     )
     .expect(ERRORS_FOUND, &["ERRORS FOUND"], "bit flip, then a panic");
