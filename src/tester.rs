@@ -9,8 +9,8 @@ use crate::{
     iobuf::{ErrorTotals, IOBuf, Pattern},
     output, ram,
     shader::{
-        ALLOCATION_TRY_STEP, ELEMENT_SIZE, EMULATE_SKIPPED_WRITE_ENV, GB,
-        MAP_FOR_GETTING_ADDRESS_SIZE, MAX_WINDOW_MB_ENV, MIN_WANTED_ALLOCATION, READ_SHADER,
+        ALLOCATION_TRY_STEP, ELEMENT_SIZE, EMULATE_ALLOCATION_LIMIT_ENV, EMULATE_SKIPPED_WRITE_ENV,
+        GB, MAP_FOR_GETTING_ADDRESS_SIZE, MAX_WINDOW_MB_ENV, MIN_WANTED_ALLOCATION, READ_SHADER,
         TEST_WINDOW_1D_MAX_GROUPS, TEST_WINDOW_MAX_SIZE, TEST_WINDOW_SIZE_GRANULARITY, VEC_SIZE,
         WG_SIZE, WRITE_MARKER,
     },
@@ -293,6 +293,15 @@ impl<'a> Tester<'a> {
     /// Splits `total` bytes into at least 2 windows of at most `max_window_size` and allocates them
     fn allocate_windows(&mut self, total: i64, max_window_size: i64) -> BoxResult<()> {
         self.free_windows();
+        // allow emulating running out of memory, for testing the retry with less memory
+        if let Some(limit) = env::var(EMULATE_ALLOCATION_LIMIT_ENV)
+            .ok()
+            .and_then(|text| crate::cli::parse_size(&text).ok())
+            && total > limit
+        {
+            erupt::utils::VulkanResult::new(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY, ())
+                .err_retry_with_lower_memory(self.env, "allocate_memory (emulated limit)")?;
+        }
         let count = max(
             2,
             total / max_window_size + i64::from(total % max_window_size != 0),
@@ -832,15 +841,16 @@ fn test_device<Writer: std::io::Write>(
         if !env.interactive {
             close::immediate_exit(true);
         }
-        if warn_on_budget_alloc_fail {
+        allocation_size -= ALLOCATION_TRY_STEP;
+        // only announce a retry if there's still a size worth trying
+        if warn_on_budget_alloc_fail && allocation_size >= MIN_WANTED_ALLOCATION {
             warn_on_budget_alloc_fail = false;
             let _ = writeln!(
                 log_dupler,
                 "Couldn't use {:5.1}GB, trying less memory. Closing other programs using the GPU can help.",
-                allocation_size as f32 / GB
+                (allocation_size + ALLOCATION_TRY_STEP) as f32 / GB
             );
         }
-        allocation_size -= ALLOCATION_TRY_STEP;
     }
 
     let test_memory_type = memory_props.memory_types[tester.test_mem_index as usize];

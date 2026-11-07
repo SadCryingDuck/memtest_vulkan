@@ -309,7 +309,7 @@ If you want to experiment with code modifications, there are two ways to do this
       
 Since most of the time the GPUs are working fine, it may be hard to check the error handling behavior. The `MEMTEST_VULKAN_EMULATE_WRITE_BUG_ITERATION` environment variable was introduced to simplify this task. Set it to non-zero number generates 'fake' error during writing to the memory on the specified iteration that later would be found and reported during check stage.
 
-Similarly, `MEMTEST_VULKAN_EMULATE_SKIPPED_WRITE_ITERATION` checks the `WRITES NOT APPLIED` detection: `0` skips the initial write of the last window, a positive number skips writing window 1 on the specified iteration.
+Similarly, `MEMTEST_VULKAN_EMULATE_SKIPPED_WRITE_ITERATION` checks the `WRITES NOT APPLIED` detection: `0` skips the initial write of the last window, a positive number skips writing window 1 on the specified iteration. `MEMTEST_VULKAN_EMULATE_ALLOCATION_LIMIT` (like `6G`) makes bigger allocations fail as out of memory, to check the retry with less memory.
 </details>
 
 # Acknowledgements

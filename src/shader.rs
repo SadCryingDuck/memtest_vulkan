@@ -159,6 +159,9 @@ pub const MAX_WINDOW_MB_ENV: &str = "MEMTEST_VULKAN_MAX_WINDOW_MB";
 /// Environment variable skipping one write pass, to check the "writes not applied" detection:
 /// 0 skips the initial write of the last window, N>0 skips writing window 1 on iteration N
 pub const EMULATE_SKIPPED_WRITE_ENV: &str = "MEMTEST_VULKAN_EMULATE_SKIPPED_WRITE_ITERATION";
+/// Environment variable making allocations above this size (like 6G) fail as out of memory,
+/// to check the retry with less memory without really running out of it
+pub const EMULATE_ALLOCATION_LIMIT_ENV: &str = "MEMTEST_VULKAN_EMULATE_ALLOCATION_LIMIT";
 
 /// Value every test window is filled with before its first write. The test pattern practically
 /// never equals it, so reading it back means the write never reached memory. Must match the shader.
