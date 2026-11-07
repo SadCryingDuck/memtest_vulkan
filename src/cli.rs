@@ -78,9 +78,9 @@ Options:
   -s, --size <SIZE>      Memory to test, like 4G or 512M (default: all free VRAM)
   -t, --duration <TIME>  How long to test, like 30s, 10m, 2h or \"endless\"
                          (default: 5m, the standard test)
-  -w, --window-mb <MB>   Limit one test window to MB megabytes (128MB steps).
-                         If errors disappear with small windows, like 512,
-                         they come from the driver, not from the memory
+  -w, --window-mb <MB>   Limit one test window to MB megabytes (128MB steps,
+                         default up to 1024). If errors disappear with small
+                         windows, like 256, they come from the driver
       --log <FILE>       Log file (default: memtest_vulkan.log in the current folder)
       --no-log           Don't write a log file
   -e, --stop-on-error    End the test at the first error, like when tuning an overclock

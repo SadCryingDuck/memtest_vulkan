@@ -122,6 +122,37 @@ fn parse_emulated_failure(text: &str) -> Option<(EmulatedFailure, u32)> {
     Some((failure, pass))
 }
 
+/// Largest default test window. The driver may place part of the test memory in system RAM
+/// when VRAM runs short; such windows are found by their speed and dropped, so smaller
+/// windows lose less of the test when that happens.
+const PREFERRED_WINDOW_MAX: i64 = 1024 * 1024 * 1024;
+/// Smallest window size considered when choosing the size that covers the most memory
+const PREFERRED_WINDOW_MIN: i64 = 512 * 1024 * 1024;
+
+/// Chooses the window size and count: windows of 512MB to 1GB (at most `max_window_size`),
+/// in TEST_WINDOW_SIZE_GRANULARITY steps, whichever covers the most of `total`, and at least
+/// 2 windows (one re-read, one rewritten). None if `total` is too small for that.
+fn plan_windows(total: i64, max_window_size: i64) -> Option<(i64, i64)> {
+    let round_down = |size: i64| size - size % TEST_WINDOW_SIZE_GRANULARITY;
+    let largest = round_down(min(max_window_size, PREFERRED_WINDOW_MAX));
+    let smallest = round_down(min(largest, PREFERRED_WINDOW_MIN));
+    let mut best: Option<(i64, i64)> = None;
+    let mut size = largest;
+    while size >= smallest && size >= TEST_WINDOW_SIZE_GRANULARITY {
+        let count = total / size;
+        // larger windows first: they win a tie
+        if count >= 2 && best.is_none_or(|(s, c)| size * count > s * c) {
+            best = Some((size, count));
+        }
+        size -= TEST_WINDOW_SIZE_GRANULARITY;
+    }
+    // too little memory for two windows of the preferred size: two smaller ones
+    best.or_else(|| {
+        let size = round_down(min(total / 2, largest));
+        (size >= TEST_WINDOW_SIZE_GRANULARITY).then_some((size, 2))
+    })
+}
+
 fn hang_error() -> Box<dyn Error> {
     format!(
         "the GPU didn't finish a test pass within {} seconds, it seems to have hung",
@@ -342,7 +373,7 @@ impl<'a> Tester<'a> {
         }
     }
 
-    /// Splits `total` bytes into at least 2 windows of at most `max_window_size` and allocates them
+    /// Splits up to `total` bytes into windows (see `plan_windows`) and allocates them
     fn allocate_windows(&mut self, total: i64, max_window_size: i64) -> BoxResult<()> {
         self.free_windows();
         // allow emulating running out of memory, for testing the retry with less memory
@@ -354,15 +385,10 @@ impl<'a> Tester<'a> {
             Err::<(), _>(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
                 .err_retry_with_lower_memory("allocate_memory (emulated limit)")?;
         }
-        let count = max(
-            2,
-            total / max_window_size + i64::from(total % max_window_size != 0),
-        ); //at least 2 windows: for testing rereads and rws
-        let size = total / count;
-        self.window_size = size - size % TEST_WINDOW_SIZE_GRANULARITY;
-        if self.window_size < TEST_WINDOW_SIZE_GRANULARITY {
+        let Some((size, count)) = plan_windows(total, max_window_size) else {
             return Err("test memory is too small".into());
-        }
+        };
+        self.window_size = size;
         for _ in 0..count {
             let buffer = unsafe {
                 self.device
@@ -1582,6 +1608,27 @@ mod tests {
 
     fn ms(values: &[u64]) -> Vec<Duration> {
         values.iter().map(|&v| Duration::from_millis(v)).collect()
+    }
+
+    #[test]
+    fn windows_cover_the_most_memory() {
+        const MB: i64 = 1024 * 1024;
+        let device_max = TEST_WINDOW_MAX_SIZE;
+        // B580: 10.69GB testable. 1GB windows would cover 10GB, 640MB windows cover 10.6GB
+        assert_eq!(plan_windows(10_949 * MB, device_max), Some((640 * MB, 17)));
+        // a tie keeps the larger windows: 1.5GB as 2 of 768MB rather than 3 of 512MB
+        assert_eq!(plan_windows(1536 * MB, device_max), Some((768 * MB, 2)));
+        assert_eq!(plan_windows(8192 * MB, device_max), Some((1024 * MB, 8)));
+        // less than two preferred windows: two smaller ones
+        assert_eq!(plan_windows(512 * MB, device_max), Some((256 * MB, 2)));
+        assert_eq!(plan_windows(200 * MB, device_max), None);
+        // --window-mb 256, or a device limiting buffers to 256MB
+        assert_eq!(plan_windows(10_240 * MB, 256 * MB), Some((256 * MB, 40)));
+        for total in (400..=24_576).step_by(97).map(|mb| mb * MB) {
+            let (size, count) = plan_windows(total, device_max).unwrap();
+            assert!(count >= 2 && size * count <= total && size <= PREFERRED_WINDOW_MAX);
+            assert_eq!(size % TEST_WINDOW_SIZE_GRANULARITY, 0);
+        }
     }
 
     #[test]
