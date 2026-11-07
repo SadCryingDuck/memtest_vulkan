@@ -4,7 +4,7 @@
 [package]
 edition = '2024'
 name = 'memtest_vulkan'
-version = '0.7.2-custom'
+version = '0.8.0-custom'
 rust-version = "1.89"
 
 [dependencies]
