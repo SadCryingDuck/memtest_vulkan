@@ -17,6 +17,7 @@ mod start_screen;
 mod tester;
 mod text;
 mod vk_util;
+mod vram_users;
 
 use devices::{LoadedDevices, NamedComputeDevice};
 use shader::{ALLOCATION_TRY_STEP, GB, MIN_WANTED_ALLOCATION};
@@ -345,7 +346,16 @@ fn select_device_and_test<Writer: std::io::Write>(
                 }
                 env.set_mem_budget_limit(size);
             }
-            None => env.set_mem_budget_limit(estimate),
+            None => {
+                env.set_mem_budget_limit(estimate);
+                // what the test can't reach, and how to free it
+                if env.interactive
+                    && let Some((used, users)) = selected.vram_used_by_others()
+                    && let Some(note) = devices::vram_note(used, &users, available_len > 1)
+                {
+                    let _ = writeln!(log_dupler, "{}", text::wrap("VRAM: ", &note));
+                }
+            }
         }
     }
     if !env.mem_budget_estimated() {

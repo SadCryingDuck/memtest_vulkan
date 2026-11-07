@@ -36,7 +36,7 @@ Log file: C:\gpu-tools\memory\memtest_vulkan.log
 1: Intel(R) Arc(TM) B580 Graphics  12GB discrete GPU  (DevId 0xE20B)
 2: AMD Radeon(TM) Graphics  11GB integrated GPU  (DevId 0x13C0)
 Testing Intel(R) Arc(TM) B580 Graphics  12GB discrete GPU  (DevId 0xE20B)
-Test plan: 6.0GB as 2 windows of 3.000GB, duration 5:00 (standard test)
+Test plan: 6.0GB as 6 windows of 1.000GB, duration 5:00 (standard test)
    0:00 / 5:00     written:    3.0GB  193.3GB/s  checked:    6.0GB  37.6GB/s  no errors
    0:01 / 5:00     written:   15.0GB  192.7GB/s  checked:   30.0GB  37.5GB/s  no errors
    0:06 / 5:00     written:   84.0GB  189.2GB/s  checked:  168.0GB  36.8GB/s  no errors
@@ -53,7 +53,7 @@ Pausing the GPU load for 15 seconds, then checking all memory again...
    5:00 / 5:00     written:  243.0GB  188.8GB/s  checked:  486.0GB  36.5GB/s  no errors
 ------------------------------------------------------------------------------
 GPU:        Intel(R) Arc(TM) B580 Graphics  12GB discrete GPU  (DevId 0xE20B)
-Tested:     6.0GB as 2 windows of 3.000GB, 1477 passes in 5:00
+Tested:     6.0GB as 6 windows of 1.000GB, 1477 passes in 5:00
 Throughput: written 4431.0GB at 176.8GB/s, checked 8868.0GB at 34.1GB/s
 Result:     PASSED - no errors found
 Next steps: Nothing to fix. When tuning an overclock, this setting passed: you can try the next
@@ -222,7 +222,9 @@ The _only_ simple thing in result interpreting - is "If some errors are reported
 
 The summary at the end of the test also gives the *likely cause* the error pattern is typical of: single-bit flips concentrated on one bit point to one faulty data line or chip, scattered single-bit flips to unstable memory (overclock, undervolt, overheating), values reading as FFFFFFFF or whole corrupted values to severe instability. These are hints based on typical patterns, not a diagnosis.
 
-If a test window reads many times slower than the others, the driver placed that part of the test memory in system RAM, usually because other programs use the VRAM. The test then drops that window and continues on the rest, so it keeps checking VRAM only; the summary shows how much was skipped. Close other programs using the GPU to test all of the memory. (The window holding the re-read data is never dropped: if it's the slow one, the test only warns that part of it checks system RAM.)
+The test can only reach the video memory no other program uses. On a discrete GPU it shows how much other programs use when that's more than 0.3GB, naming the biggest users on Windows. Closing them lets the test cover more of the memory. On a PC with a second GPU (like the one built into the CPU), connecting the monitor to that one while testing also frees the memory the Windows desktop uses.
+
+The test memory is split into windows of 512MB to 1GB. If a test window reads many times slower than the others, the driver placed that part of the test memory in system RAM, usually because other programs use the VRAM. The test then drops that window and continues on the rest, so it keeps checking VRAM only; the summary shows how much was skipped. (The window holding the re-read data is never dropped: if it's the slow one, the test only warns that part of it checks system RAM.)
 
 Integrated GPUs use system RAM as video memory, so by default they test only the system RAM that is available, minus a reserve for the system and other programs (20% of the total RAM, at least 2GB). The amount is shown when the test starts, and `--size` changes it.
 
@@ -290,7 +292,7 @@ Also try running with root/admin privileges - this is sometimes required on head
 
 There are some reports that testing AMD GPUs sometimes gives unexpectedly low GPU load & video memory usage. The issue is still under investigation, but it is known that disabling/enabling "resizable BAR" in BIOS may help.
 
-Also, some drivers don't allow single memory allocations or buffers bigger than ~4GB (`maxMemoryAllocationSize`/`maxBufferSize`), even on a GPU with a lot of memory. The tested memory is split into windows of at most 3.875GB, each with its own allocation and buffer kept within the limits the driver reports, so the whole memory is still tested.
+Also, some drivers don't allow single memory allocations or buffers bigger than ~4GB (`maxMemoryAllocationSize`/`maxBufferSize`), even on a GPU with a lot of memory. The tested memory is split into windows of at most 1GB, each with its own allocation and buffer kept within the limits the driver reports, so the whole memory is still tested.
 
 If the test reports `WRITES NOT APPLIED`, it found a big contiguous block (1MB or more) of memory the test never managed to write to: it still holds the marker written before the test pattern, the data of the previous pass, or reads as all zeros. Faulty VRAM gives scattered errors instead, so this is most likely a GPU driver or memtest_vulkan problem and the results of that run are invalid. Try limiting the window size with `--window-mb 512` (or the `MEMTEST_VULKAN_MAX_WINDOW_MB` environment variable, rounded down to 128MB steps) or another driver version. If errors disappear with smaller windows, they were caused by the driver, not the memory. If they persist everywhere, the GPU itself may be faulty.
 

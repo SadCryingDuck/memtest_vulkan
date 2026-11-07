@@ -4,6 +4,7 @@ use crate::{
     ProcessEnv, output, ram,
     shader::{GB, TEST_DATA_KEEP_FREE},
     vk_util::{LAYER_KHRONOS_VALIDATION, MapErrStr, VK_LOADER_DEBUG, debug_callback, load_vulkan},
+    vram_users,
 };
 use ash::vk;
 use core::cmp::{max, min};
@@ -60,6 +61,8 @@ pub struct NamedComputeDevice {
     pub budget_props: MemoryBudget,
     pub index_in_device_iteration: usize,
     pub size_limits: DeviceSizeLimits,
+    /// The adapter's locally unique ID on Windows, which identifies it to the OS
+    pub luid: Option<[u8; vk::LUID_SIZE]>,
 }
 
 impl NamedComputeDevice {
@@ -119,6 +122,26 @@ impl NamedComputeDevice {
         )
     }
 
+    /// Dedicated memory other programs use on a discrete GPU, with the biggest users when the
+    /// system tells (Windows). Without that, estimated from the driver's memory budget.
+    pub fn vram_used_by_others(&self) -> Option<(i64, Vec<(String, u64)>)> {
+        if self.physical_props.device_type != vk::PhysicalDeviceType::DISCRETE_GPU {
+            return None;
+        }
+        if let Some(users) = self.luid.and_then(vram_users::dedicated_users) {
+            let total = users.iter().map(|(_, bytes)| *bytes as i64).sum();
+            return Some((total, users));
+        }
+        let heaps = &self.memory_props.memory_heaps[..self.memory_props.memory_heap_count as usize];
+        let (index, heap) = heaps
+            .iter()
+            .enumerate()
+            .filter(|(_, heap)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .max_by_key(|(_, heap)| heap.size)?;
+        let budget = self.budget_props.heap_budget[index];
+        (budget > 0 && budget < heap.size).then(|| ((heap.size - budget) as i64, Vec::new()))
+    }
+
     /// `testable_memory`, logging how it was found
     pub fn estimate_testable_memory<Writer: std::io::Write>(
         &self,
@@ -163,6 +186,39 @@ impl NamedComputeDevice {
         }
         max_budget
     }
+}
+
+/// Explains the GPU memory other programs use, when it's enough to matter: that memory can't
+/// be tested. `users` are the biggest users, if known; `other_gpu`: another GPU could drive the
+/// display while testing, which frees the memory the desktop uses on this one.
+pub fn vram_note(used_by_others: i64, users: &[(String, u64)], other_gpu: bool) -> Option<String> {
+    const WORTH_MENTIONING: i64 = 300 * 1024 * 1024;
+    const LISTED_MIN: u64 = 50 * 1024 * 1024;
+    if used_by_others < WORTH_MENTIONING {
+        return None;
+    }
+    let named: Vec<String> = users
+        .iter()
+        .filter(|(_, bytes)| *bytes >= LISTED_MIN)
+        .take(3)
+        .map(|(name, bytes)| format!("{name} {:.1}GB", *bytes as f32 / GB))
+        .collect();
+    let mut note = format!(
+        "{:.1}GB is used by other programs{}, so it can't be tested. Close the ones you can to \
+         test more of it",
+        used_by_others as f32 / GB,
+        if named.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", named.join(", "))
+        }
+    );
+    if other_gpu {
+        note += ", and connect the monitor to the other GPU while testing to free the memory \
+                 the desktop uses on this one";
+    }
+    note.push('.');
+    Some(note)
 }
 
 /// The debug messenger printing validation layer messages, and its extension loader
@@ -312,6 +368,7 @@ struct Candidate {
     budget_props: MemoryBudget,
     index_in_device_iteration: usize,
     size_limits: DeviceSizeLimits,
+    luid: Option<[u8; vk::LUID_SIZE]>,
 }
 
 /// Queries one physical device; None if it can't run the test
@@ -357,13 +414,15 @@ unsafe fn query_candidate(
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
     let mut maintenance4 = vk::PhysicalDeviceMaintenance4Properties::default();
+    let mut id_props = vk::PhysicalDeviceIDProperties::default();
     let mut size_limits = DeviceSizeLimits::default();
 
     let properties = {
-        // maxMemoryAllocationSize is Vulkan 1.1 core. The chained structures stay borrowed
-        // until device_props2 goes away at the end of this block.
-        let mut device_props2 =
-            vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance3);
+        // maxMemoryAllocationSize and the device LUID are Vulkan 1.1 core. The chained
+        // structures stay borrowed until device_props2 goes away at the end of this block.
+        let mut device_props2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut maintenance3)
+            .push_next(&mut id_props);
         if has_pci_bus_info {
             device_props2 = device_props2.push_next(&mut pci_bus_info);
         }
@@ -402,6 +461,7 @@ unsafe fn query_candidate(
         },
         index_in_device_iteration,
         size_limits,
+        luid: (id_props.device_luid_valid == vk::TRUE).then_some(id_props.device_luid),
     })
 }
 
@@ -463,6 +523,7 @@ pub fn list_devices_ordered_labeled_from_1<Writer: std::io::Write>(
             budget_props: candidate.budget_props,
             index_in_device_iteration: candidate.index_in_device_iteration,
             size_limits: candidate.size_limits,
+            luid: candidate.luid,
         };
         let mut details = format!("DevId 0x{:04X}", props.device_id);
         if let Some((bus, slot)) = candidate.pci_bus {
@@ -491,4 +552,38 @@ pub fn list_devices_ordered_labeled_from_1<Writer: std::io::Write>(
         debug_messenger,
         devices,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MB: i64 = 1024 * 1024;
+
+    #[test]
+    fn vram_note_names_the_biggest_users() {
+        let users = [
+            ("Windows desktop".to_owned(), 517 * MB as u64),
+            ("Discord".to_owned(), 154 * MB as u64),
+            ("Intel Graphics Software".to_owned(), 101 * MB as u64),
+            ("explorer".to_owned(), 77 * MB as u64),
+            ("csrss".to_owned(), 30 * MB as u64),
+        ];
+        let note = vram_note(879 * MB, &users, true).unwrap();
+        assert_eq!(
+            note,
+            "0.9GB is used by other programs (Windows desktop 0.5GB, Discord 0.2GB, Intel \
+             Graphics Software 0.1GB), so it can't be tested. Close the ones you can to test \
+             more of it, and connect the monitor to the other GPU while testing to free the \
+             memory the desktop uses on this one."
+        );
+        // without names (no counters) or another GPU
+        assert_eq!(
+            vram_note(700 * MB, &[], false).unwrap(),
+            "0.7GB is used by other programs, so it can't be tested. Close the ones you can to \
+             test more of it."
+        );
+        // little enough not to matter
+        assert_eq!(vram_note(200 * MB, &users, true), None);
+    }
 }
