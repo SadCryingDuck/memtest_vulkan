@@ -88,7 +88,7 @@ Options:
   -b, --batch            No prompts and no key press at the end, for scripts
   -v, --verbose          Print diagnostic information
   -h, --help             Show this help
-  -V, --version          Show the version
+  -V, --version          Show the version and license
 
 Press Ctrl+C once to stop testing and show the results, twice to quit at once.
 

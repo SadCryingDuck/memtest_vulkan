@@ -45,6 +45,13 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - uses: actions/checkout@v7
+        with:
+          path: source
+      - name: License texts
+        run: |
+          cp source/LICENSE dist/LICENSE.txt
+          cp source/licenses/zlib-original.txt dist/LICENSE-zlib-original.txt
       - name: Checksums
         working-directory: dist
         run: sha256sum * | tee SHA256SUMS.txt
