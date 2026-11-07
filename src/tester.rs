@@ -104,6 +104,8 @@ enum EmulatedFailure {
     DeviceLost,
     Hang,
     Panic,
+    /// window 2's data is lost during the hold (overwritten with the pre-write marker)
+    Fade,
 }
 
 /// Parses the EMULATE_FAILURE_ENV value: the failure and the 1-based pass it happens in
@@ -116,6 +118,7 @@ fn parse_emulated_failure(text: &str) -> Option<(EmulatedFailure, u32)> {
         "device-lost" => EmulatedFailure::DeviceLost,
         "hang" => EmulatedFailure::Hang,
         "panic" => EmulatedFailure::Panic,
+        "fade" => EmulatedFailure::Fade,
         _ => return None,
     };
     Some((failure, pass))
@@ -586,6 +589,7 @@ impl<'a> Tester<'a> {
         io_out: &IOBuf,
         window_idx: usize,
         mode: ReadMode,
+        data_verified: bool,
     ) -> BoxResult<bool> {
         let test_offset = self.window_size * window_idx as i64;
         let Some((error_range, total_errors)) = io_out.get_error_addresses_and_count(test_offset)
@@ -603,7 +607,7 @@ impl<'a> Tester<'a> {
             )
             .into());
         }
-        let unwritten = totals.add(io_out);
+        let unwritten = totals.add_read(io_out, data_verified);
         let unwritten_words = unwritten.as_ref().map_or(0, |evidence| evidence.words());
         if unwritten.is_some() {
             close::raise_status_bit(close::app_status::WRITES_NOT_APPLIED);
@@ -1078,6 +1082,7 @@ fn initial_fill<Writer: std::io::Write>(
             &io_out,
             window_idx,
             ReadMode::InitialRead,
+            false,
         )? {
             *last_error_at = Some(Duration::ZERO);
         }
@@ -1179,20 +1184,30 @@ fn windows_to_drop(slow: &[usize], active: &[bool]) -> Vec<usize> {
         .collect()
 }
 
-/// In a pulsed phase, called after each pass: idles the GPU when a burst of load is over.
-/// Returns true if Ctrl+C was pressed meanwhile.
-fn pulsed_gap(pulse: &mut Pulse) -> bool {
+/// What happened after a pass in a pulsed phase
+#[derive(Clone, Copy, PartialEq)]
+enum Gap {
+    /// the burst of load goes on
+    None,
+    /// the GPU idled
+    Taken,
+    /// Ctrl+C was pressed while idling
+    Interrupted,
+}
+
+/// In a pulsed phase, called after each pass: idles the GPU when a burst of load is over
+fn pulsed_gap(pulse: &mut Pulse) -> Gap {
     let Some(gap) = pulse.after_pass(Instant::now()) else {
-        return false;
+        return Gap::None;
     };
     let gap_end = Instant::now() + gap;
     while let Some(left) = gap_end.checked_duration_since(Instant::now()) {
         std::thread::sleep(min(left, Duration::from_millis(50)));
         if close::close_requested() {
-            return true;
+            return Gap::Interrupted;
         }
     }
-    false
+    Gap::Taken
 }
 
 /// Drops windows the driver placed in system RAM (found by `find_slow_windows`), so the rest of
@@ -1277,6 +1292,12 @@ fn main_loop<Writer: std::io::Write>(
     let mut kind = phase.kinds[0];
     let mut pairs = 0usize;
     let mut pulse = Pulse::default();
+    // A read right after a pulsed idle gap or the hold may run at lowered memory clocks, so its
+    // time isn't used to spot windows placed in system RAM
+    let mut after_gap = false;
+    // Windows whose data read back correctly since it was written: wrong values found there
+    // later are lost data, never writes that didn't land
+    let mut verified = vec![false; window_count];
     let multi_phase = env.options.mode == TestMode::Thorough;
     let mut standard_announced = false;
     let mut swap_warning: Option<String> = None;
@@ -1344,9 +1365,16 @@ fn main_loop<Writer: std::io::Write>(
             let pattern = Pattern::of_kind(kind, buffer_in.iter, window_idx as i64);
             before[window_idx] = written[window_idx];
             written[window_idx] = pattern;
+            verified[window_idx] = false;
             period.write_time += tester.write_window(window_idx, pattern, false, write_pipeline)?;
             period.written += tester.window_size;
-            if close::close_requested() || (phase.pulsed && pulsed_gap(&mut pulse)) {
+            let gap = if phase.pulsed {
+                pulsed_gap(&mut pulse)
+            } else {
+                Gap::None
+            };
+            after_gap |= gap == Gap::Taken;
+            if close::close_requested() || gap == Gap::Interrupted {
                 stop_requested = true;
                 break 'test;
             }
@@ -1367,6 +1395,14 @@ fn main_loop<Writer: std::io::Write>(
                 )?;
                 // stay on the patterns just written: the check finds data that faded
                 tester.order.set(AccessOrder::Sequential);
+                if tester
+                    .emulated_failure
+                    .is_some_and(|(failure, _)| failure == EmulatedFailure::Fade)
+                    && tester.is_active(1)
+                {
+                    // fill window 2 with the marker and write nothing over it
+                    tester.run_pass(1, true, None)?;
+                }
                 let pause_start = Instant::now();
                 while pause_start.elapsed() < hold {
                     log_dupler.show_live_line(&format!(
@@ -1399,16 +1435,31 @@ fn main_loop<Writer: std::io::Write>(
                     io.set_previous_pattern(Some(before[window_idx]));
                     io
                 };
+                let data_verified = verified[window_idx];
                 let (io_out, read_time) = tester.read_window(window_idx, io_in)?;
                 period.read_time += read_time;
                 period.read += tester.window_size;
-                window_read_times[window_idx] += read_time;
+                if pass == 0 && !after_gap {
+                    window_read_times[window_idx] += read_time;
+                }
+                after_gap = false;
                 let mode = if window_idx == 0 {
                     window0_mode
                 } else {
                     other_mode
                 };
-                if tester.report_errors(log_dupler, &mut totals, &io_out, window_idx, mode)? {
+                let had_errors = tester.report_errors(
+                    log_dupler,
+                    &mut totals,
+                    &io_out,
+                    window_idx,
+                    mode,
+                    data_verified,
+                )?;
+                if !had_errors && pass == 0 {
+                    verified[window_idx] = true;
+                }
+                if had_errors {
                     last_error_at = Some(start.elapsed());
                     window_had_errors[window_idx] = true;
                     if !alerted {
@@ -1421,8 +1472,13 @@ fn main_loop<Writer: std::io::Write>(
                     }
                 }
                 // no gaps in the check after the hold, which should follow it right away
-                if close::close_requested() || (phase.pulsed && pass == 0 && pulsed_gap(&mut pulse))
-                {
+                let gap = if phase.pulsed && pass == 0 {
+                    pulsed_gap(&mut pulse)
+                } else {
+                    Gap::None
+                };
+                after_gap |= gap == Gap::Taken;
+                if close::close_requested() || gap == Gap::Interrupted {
                     stop_requested = true;
                     break 'test;
                 }
@@ -1702,6 +1758,7 @@ mod tests {
             Some((DeviceLost, 20))
         );
         assert_eq!(parse_emulated_failure("panic:3"), Some((Panic, 3)));
+        assert_eq!(parse_emulated_failure("fade"), Some((Fade, 1)));
         assert_eq!(parse_emulated_failure("hang:0"), None);
         assert_eq!(parse_emulated_failure("hang:x"), None);
         assert_eq!(parse_emulated_failure("crash"), None);

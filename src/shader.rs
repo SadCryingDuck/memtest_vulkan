@@ -223,7 +223,8 @@ pub const EMULATE_SKIPPED_WRITE_ENV: &str = "MEMTEST_VULKAN_EMULATE_SKIPPED_WRIT
 pub const EMULATE_ALLOCATION_LIMIT_ENV: &str = "MEMTEST_VULKAN_EMULATE_ALLOCATION_LIMIT";
 /// Environment variable making a GPU pass fail, to check how failures are reported:
 /// `device-lost`, `hang` or `panic`, optionally with the pass number like `hang:20` (default 1;
-/// the first passes are the initial fill, two per window)
+/// the first passes are the initial fill, two per window), or `fade`: window 2 loses its data
+/// during the hold
 pub const EMULATE_FAILURE_ENV: &str = "MEMTEST_VULKAN_EMULATE_FAILURE";
 
 /// Value every test window is filled with before its first write. The test pattern practically

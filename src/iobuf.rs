@@ -402,11 +402,22 @@ pub struct ErrorTotals {
 impl ErrorTotals {
     /// Adds the findings of one read pass. Returns the evidence of unwritten memory, if any.
     pub fn add(&mut self, buf: &IOBuf) -> Option<UnwrittenEvidence> {
+        self.add_read(buf, false)
+    }
+
+    /// Adds the findings of a read. `data_verified`: this data already read back correctly,
+    /// so a write that never landed can't explain wrong values: they're all memory errors
+    /// (like data lost during the load pause).
+    pub fn add_read(&mut self, buf: &IOBuf, data_verified: bool) -> Option<UnwrittenEvidence> {
         let wrong = buf.wrong_words();
         if wrong == 0 {
             return None;
         }
-        let unwritten = buf.unwritten_evidence();
+        let unwritten = if data_verified {
+            None
+        } else {
+            buf.unwritten_evidence()
+        };
         let unwritten_words = unwritten.as_ref().map_or(0, UnwrittenEvidence::words);
         self.unwritten += unwritten_words.min(wrong);
         let memory_errors = wrong - unwritten_words.min(wrong);
@@ -523,6 +534,11 @@ mod tests {
         assert!(totals.add(&buf).is_some());
         assert_eq!(totals.memory_errors, 0);
         assert_eq!(totals.unwritten, 0x1000_0000);
+        // the same block in data that already read back correctly: lost data, a memory error
+        let mut totals = ErrorTotals::default();
+        assert!(totals.add_read(&buf, true).is_none());
+        assert_eq!(totals.memory_errors, 0x1000_0000);
+        assert_eq!(totals.unwritten, 0);
     }
 
     #[test]
