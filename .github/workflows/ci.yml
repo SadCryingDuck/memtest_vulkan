@@ -1,10 +1,12 @@
 name: ci
 
 # Checks and builds pushes to master and every pull request; the release workflow reuses it for tags.
+# It can also be started by hand for any branch (Actions tab, or gh workflow run ci.yml --ref <branch>).
 on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
   workflow_call:
     inputs:
       version-label:
