@@ -22,21 +22,38 @@ Any found errors are immediately reported with a multi-line details. Detailed de
 Alternatively, the tool can be started from cmdline
 </summary>
 <pre>
-C:\gpu-tools\memory>memtest_vulkan.exe
-https://github.com/GpuZelenograd/memtest_vulkan v0.3.0 by GpuZelenograd
-To finish testing use Ctrl+C
+C:\gpu-tools\memory>memtest_vulkan.exe --device 1 --size 6G
+https://github.com/GpuZelenograd/memtest_vulkan v0.7.2-custom by GpuZelenograd
+Press Ctrl+C to stop testing early. Options: memtest_vulkan --help
+Log file: C:\gpu-tools\memory\memtest_vulkan.log
 
-1: Bus=0x00:00 DevId=0x9A49   8GB Intel(R) Iris(R) Xe Graphics
-Testing 1: Bus=0x00:00 DevId=0x9A49   8GB Intel(R) Iris(R) Xe Graphics
-      1 iteration. Since last report passed 271.3561ms      written     1.8GB, read:     3.5GB     19.3GB/sec
-      5 iteration. Since last report passed 1.0910091s      written     7.0GB, read:    14.0GB     19.2GB/sec
-     42 iteration. Since last report passed 10.2049349s     written    64.8GB, read:   129.5GB     19.0GB/sec
-    409 iteration. Since last report passed 100.2136744s    written   642.2GB, read:  1284.5GB     19.2GB/sec
-    791 iteration. Since last report passed 100.0165577s    written   668.5GB, read:  1337.0GB     20.1GB/sec
-   1173 iteration. Since last report passed 100.1249672s    written   668.5GB, read:  1337.0GB     20.0GB/sec
-   1551 iteration. Since last report passed 100.0042873s    written   661.5GB, read:  1323.0GB     19.8GB/sec
-(Ctrl-C pressed)
-memtest_vulkan: no any errors, testing PASSed.
+1: Intel(R) Arc(TM) B580 Graphics  12GB discrete GPU  (DevId 0xE20B)
+2: AMD Radeon(TM) Graphics  11GB integrated GPU  (DevId 0x13C0)
+Testing Intel(R) Arc(TM) B580 Graphics  12GB discrete GPU  (DevId 0xE20B)
+Test plan: 6.0GB as 2 windows of 3.000GB, duration 5:00 (standard test)
+    0:00 / 5:00     written:    3.0GB  193.3GB/s   checked:    6.0GB   37.6GB/s   no errors
+    0:01 / 5:00     written:   15.0GB  192.7GB/s   checked:   30.0GB   37.5GB/s   no errors
+    0:06 / 5:00     written:   84.0GB  189.2GB/s   checked:  168.0GB   36.8GB/s   no errors
+    0:36 / 5:00     written:  492.0GB  185.6GB/s   checked:  984.0GB   36.0GB/s   no errors
+    1:06 / 5:00     written:  486.0GB  183.4GB/s   checked:  972.0GB   35.4GB/s   no errors
+    1:36 / 5:00     written:  459.0GB  174.7GB/s   checked:  918.0GB   33.3GB/s   no errors
+    2:06 / 5:00     written:  408.0GB  154.0GB/s   checked:  816.0GB   29.7GB/s   no errors
+    2:36 / 5:00     written:  387.0GB  148.8GB/s   checked:  774.0GB   28.1GB/s   no errors
+    3:06 / 5:00     written:  504.0GB  189.4GB/s   checked: 1008.0GB   36.8GB/s   no errors
+    3:36 / 5:00     written:  501.0GB  187.9GB/s   checked: 1002.0GB   36.5GB/s   no errors
+    4:06 / 5:00     written:  480.0GB  180.1GB/s   checked:  960.0GB   34.9GB/s   no errors
+Pausing the GPU load for 15 seconds, then checking all memory again...
+    4:45 / 5:00     written:  369.0GB  179.1GB/s   checked:  744.0GB   34.7GB/s   no errors
+    5:00 / 5:00     written:  243.0GB  188.8GB/s   checked:  486.0GB   36.5GB/s   no errors
+------------------------------------------------------------------------------
+GPU:        Intel(R) Arc(TM) B580 Graphics  12GB discrete GPU  (DevId 0xE20B)
+Tested:     6.0GB as 2 windows of 3.000GB, 1477 passes in 5:00
+Throughput: written 4431.0GB at 176.8GB/s, checked 8868.0GB at 34.1GB/s
+Result:     PASSED - no errors found
+Log file:   C:\gpu-tools\memory\memtest_vulkan.log
+------------------------------------------------------------------------------
+
+memtest_vulkan: no errors, test PASSED.
   press any key to continue...
 </pre>
 </details>
