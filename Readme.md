@@ -1,4 +1,6 @@
-# [memtest_vulkan](https://github.com/GpuZelenograd/memtest_vulkan/blob/main/Readme.md) - GPU memory testing tool
+# [memtest_vulkan](https://github.com/SadCryingDuck/memtest_vulkan) - GPU memory testing tool
+
+This is SadCryingDuck's fork of [GpuZelenograd/memtest_vulkan](https://github.com/GpuZelenograd/memtest_vulkan); its versions end with `-duck`. It adds command line options, a clear end to the standard test with a summary, protection against false errors from driver limits and memory placed in system RAM, an inverted test pattern and modernized tooling.
 
 Opensource cross-platform tool written in vulkan compute to stress test video memory for stability during overclocking or repair.
 
@@ -8,8 +10,8 @@ Requires system-provided vulkan loader and driver supporting Vulkan 1.1 (already
 
 ## Installation & Usage (Windows)
 
-### [**<kbd>📥</kbd>** Get .exe from latest release](https://github.com//GpuZelenograd/memtest_vulkan/releases#user-content-Downloads)
-GitHub users also may want to try [CI build artifacts](https://github.com/GpuZelenograd/memtest_vulkan/actions) (only last 3 months kept).
+### [**<kbd>📥</kbd>** Get .exe from latest release](https://github.com/SadCryingDuck/memtest_vulkan/releases/latest)
+GitHub users also may want to try [CI build artifacts](https://github.com/SadCryingDuck/memtest_vulkan/actions) (only last 3 months kept).
 
 Start test by double-clicking the utility, no installation / parameters / configuration / admin-rights required.
 ![WindowsScreenshot](.github/memtest_vulkan_windows_rtx2070.png)
@@ -23,8 +25,8 @@ Alternatively, the tool can be started from cmdline
 </summary>
 <pre>
 C:\gpu-tools\memory>memtest_vulkan.exe --device 1 --size 6G
-https://github.com/GpuZelenograd/memtest_vulkan v0.7.2-custom by GpuZelenograd
-Press Ctrl+C to stop testing early. Options: memtest_vulkan --help
+memtest_vulkan v0.10.0-duck  https://github.com/SadCryingDuck/memtest_vulkan
+Based on memtest_vulkan by GpuZelenograd. Press Ctrl+C to stop testing early, see --help for options.
 Log file: C:\gpu-tools\memory\memtest_vulkan.log
 
 1: Intel(R) Arc(TM) B580 Graphics  12GB discrete GPU  (DevId 0xE20B)
@@ -90,7 +92,7 @@ The older form `memtest_vulkan <device> [<bytes>]` still works and tests without
 ### Installation & Usage (Linux)
 
 Install by unpacking archives with linux prebuilt binaries for X86_64 (Desktop) or AARCH64 (Embedded) from 
-[Releases](https://github.com//GpuZelenograd/memtest_vulkan/releases#user-content-Downloads) or [![ci build](https://github.com/GpuZelenograd/memtest_vulkan/actions/workflows/ci.yml/badge.svg) artifacts](https://github.com/GpuZelenograd/memtest_vulkan/actions) (github account required). Build artifacts are transparently produced from source by github actions, but only last 3 months kept.
+[Releases](https://github.com/SadCryingDuck/memtest_vulkan/releases/latest) or [![ci build](https://github.com/SadCryingDuck/memtest_vulkan/actions/workflows/ci.yml/badge.svg) artifacts](https://github.com/SadCryingDuck/memtest_vulkan/actions) (github account required). Build artifacts are transparently produced from source by github actions, but only last 3 months kept.
 
 Use by opening a terminal in a folder with extracted file and explicitly running `./memtest_vulkan`. Do NOT just double-click binary in GUI (it would lead to starting test in the background without ability to stop it - [issue](https://github.com/GpuZelenograd/memtest_vulkan/issues/11))
 
@@ -285,28 +287,41 @@ Also, some drivers don't allow single memory allocations or buffers bigger than 
 
 If the test reports `WRITES NOT APPLIED`, it found a big contiguous block (1MB or more) of memory the test never managed to write to: it still holds the marker written before the test pattern, the data of the previous pass, or reads as all zeros. Faulty VRAM gives scattered errors instead, so this is most likely a GPU driver or memtest_vulkan problem and the results of that run are invalid. Try limiting the window size with `--window-mb 512` (or the `MEMTEST_VULKAN_MAX_WINDOW_MB` environment variable, rounded down to 128MB steps) or another driver version. If errors disappear with smaller windows, they were caused by the driver, not the memory. If they persist everywhere, the GPU itself may be faulty.
 
-If nothing helps - enable verbose mode by renaming the executable to `memtest_vulkan_verbose` and running again. The test will output diagnostic information to stdout - please copy it to a new issue at https://github.com/GpuZelenograd/memtest_vulkan/issues.
+If nothing helps - enable verbose mode by renaming the executable to `memtest_vulkan_verbose` and running again. The test will output diagnostic information to stdout - please copy it to a new issue at https://github.com/SadCryingDuck/memtest_vulkan/issues.
 
 <details><summary>
 
 ## <a id="development">New feature development</a>
 
 </summary>
-New ideas in the form of [suggestions via creating issues](https://github.com/GpuZelenograd/memtest_vulkan/issues) or pull requests are welcome. However, note that the tool is designed to be cross-platform, so an optimal way to add temperature and hardware monitoring is [relying on VK_KHR_performance_query extension](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkPerformanceCounterUnitKHR.html), but unfortunately this extension isn't widely supported by 2022.
+New ideas in the form of [suggestions via creating issues](https://github.com/SadCryingDuck/memtest_vulkan/issues) or pull requests are welcome. However, note that the tool is designed to be cross-platform, so an optimal way to add temperature and hardware monitoring is [relying on VK_KHR_performance_query extension](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkPerformanceCounterUnitKHR.html), but unfortunately this extension isn't widely supported by 2022.
 
 Note that portability is limited to 64-bit targets. Building versions for 32-bit targets was never tried, and all notices below assume 64-bit targets.
 
 If you want to experiment with code modifications, there are two ways to do this:
- - the classic way of cloning repo, editing code and use locally-installed `cargo` to build binaries from modified rust source code
-      - for cross-building to windows from linux the `x86_64-w64-mingw32-gcc` linker is used, for ubuntu the `gcc-mingw-w64-x86-64-win32` package provides it.
-      - for cross-building to arm linux from other arhitectures the `aarch64-linux-gnu-gcc` linker is used, for ubuntu the `gcc-aarch64-linux-gnu` package provides it.
-      - as an alternative a [docker container suitable for rust crossbuilding](https://github.com/galkinvv/manycross2014/pkgs/container/manycross2014) can be used, this is even required for targeting x86_64-win7-windows-gnu Windows7-compatible target. It provides preinstalled rust targets for all build varints mentioned in `./run-build.sh`.
+ - the classic way: clone the repo, edit the code and build with a locally installed [Rust](https://rustup.rs) (`rust-toolchain.toml` selects the latest stable toolchain): `cargo build --release`. `./run-lint.sh` runs the same checks as CI: formatting, clippy and the unit tests.
+      - Linux binaries for x86_64 and aarch64 are built with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) against glibc 2.17, so they run on distributions back to 2014: `cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17` (or `aarch64-unknown-linux-gnu.2.17`). This works from Windows, Linux and macOS.
+      - Windows binaries link the C runtime statically (see `.cargo/config.toml`), so they don't need the Visual C++ Redistributable.
  - or the "fast way to make a small change relying on the github infrastructure". This can be useful if you are not familiar with building rust and don't plan to install it locally
       - fork this repository
       - enable workflows on the actions tab of the forked repository
       - edit&commit code changes (small changes are possible even via editing with a browser)
-      - and github will build the binary from your changes for you as the artifacts on the actions tab in 5 minutes!
-      
+      - and github will build the binaries from your changes as artifacts on the actions tab in a few minutes!
+
+### Releases
+
+Releases are built and published by GitHub Actions (`.github/workflows/release.yml`) when a version tag is pushed:
+1. set the new version in `Cargo.toml`, keeping the `-duck` suffix that marks this fork's builds, like `version = '0.10.1-duck'`, and commit it
+2. tag that commit with the same version and push the tag: `git tag v0.10.1-duck` and `git push origin v0.10.1-duck`
+
+The workflow checks that the tag matches the version, runs the checks and tests, builds Windows x86_64, Linux x86_64 and Linux aarch64 in parallel and publishes a release with these files and their SHA-256 checksums:
+ - `memtest_vulkan-v0.10.1-duck-windows-x86_64.exe`
+ - `memtest_vulkan-v0.10.1-duck-linux-x86_64.tar.xz`
+ - `memtest_vulkan-v0.10.1-duck-linux-aarch64.tar.xz`
+ - `SHA256SUMS.txt`
+
+The Windows 7 builds of the original project need a special nightly toolchain and aren't made by this fork.
+
 Since most of the time the GPUs are working fine, it may be hard to check the error handling behavior. The `MEMTEST_VULKAN_EMULATE_WRITE_BUG_ITERATION` environment variable was introduced to simplify this task. Set it to non-zero number generates 'fake' error during writing to the memory on the specified iteration that later would be found and reported during check stage.
 
 Similarly, `MEMTEST_VULKAN_EMULATE_SKIPPED_WRITE_ITERATION` checks the `WRITES NOT APPLIED` detection: `0` skips the initial write of the last window, a positive number skips writing window 1 on the specified iteration. `MEMTEST_VULKAN_EMULATE_ALLOCATION_LIMIT` (like `6G`) makes bigger allocations fail as out of memory, to check the retry with less memory.
