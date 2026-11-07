@@ -1,4 +1,9 @@
 use core::fmt;
+use crossterm::{
+    cursor::MoveToColumn,
+    style::Print,
+    terminal::{Clear, ClearType},
+};
 use std::{
     collections::VecDeque,
     fs::File,
@@ -53,6 +58,10 @@ pub struct LogDupler<Writer: io::Write> {
     pub log_file_name: Option<String>,
     pub max_size: u64,
     pub unlogged_buffer: VecDeque<u8>,
+    /// a progress line can be shown on the console (not in the log)
+    live_line_enabled: bool,
+    /// the progress line is on the screen: normal output replaces it
+    live_line_shown: bool,
 }
 
 impl<Writer: io::Write> LogDupler<Writer> {
@@ -74,6 +83,37 @@ impl<Writer: io::Write> LogDupler<Writer> {
             log_file_name,
             max_size,
             unlogged_buffer: initial_buf.into(),
+            live_line_enabled: false,
+            live_line_shown: false,
+        }
+    }
+    /// Allows showing a progress line, updated in place on the console
+    pub fn enable_live_line(&mut self) {
+        self.live_line_enabled = true;
+    }
+    /// Shows `text` as the progress line, replacing the previous one. It isn't logged, and any
+    /// normal output replaces it until the next update.
+    pub fn show_live_line(&mut self, text: &str) {
+        if !self.live_line_enabled {
+            return;
+        }
+        // stay within one console line, or the next update can't replace it
+        let width = crossterm::terminal::size().map_or(80, |(columns, _)| columns as usize);
+        let text: String = text.chars().take(width.saturating_sub(1)).collect();
+        let _ = crossterm::queue!(
+            self.writer,
+            MoveToColumn(0),
+            Print(text),
+            Clear(ClearType::UntilNewLine)
+        );
+        let _ = self.writer.flush();
+        self.live_line_shown = true;
+    }
+    /// Removes the progress line from the screen
+    pub fn clear_live_line(&mut self) {
+        if self.live_line_shown {
+            self.live_line_shown = false;
+            let _ = crossterm::queue!(self.writer, MoveToColumn(0), Clear(ClearType::CurrentLine));
         }
     }
     fn try_open(&mut self) -> bool {
@@ -146,6 +186,7 @@ impl<Writer: io::Write> LogDupler<Writer> {
 
 impl<Writer: io::Write> Drop for LogDupler<Writer> {
     fn drop(&mut self) {
+        self.clear_live_line();
         let mut final_buf: Vec<u8> = Default::default();
         let _ = writeln!(&mut final_buf, "logging finished at {}", NowTime);
         self.unlogged_buffer.extend(final_buf);
@@ -159,6 +200,7 @@ impl<Writer: io::Write> Drop for LogDupler<Writer> {
 }
 impl<Writer: io::Write> Write for LogDupler<Writer> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.clear_live_line();
         // write_all: a plain write may accept only part of the buffer, cutting console output
         let _ = self.writer.write_all(buf);
         self.unlogged_buffer.extend(buf);

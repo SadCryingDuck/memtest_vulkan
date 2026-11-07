@@ -22,7 +22,7 @@ use erupt::{DeviceLoader, vk};
 use std::{
     env,
     error::Error,
-    io::Write,
+    io::{IsTerminal, Write},
     mem,
     time::{Duration, Instant},
 };
@@ -35,6 +35,8 @@ const FENCE_WAIT_SLICE_NS: u64 = 1_000_000_000;
 /// Pause of the GPU load near the end of the test: checks memory left idle while the GPU is hot
 const LOAD_PAUSE: Duration = Duration::from_secs(15);
 const REPORT_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the progress line on the console is updated
+const LIVE_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 /// Write passes this many times slower than writes to a single window mean the test memory
 /// doesn't fit in VRAM and the driver swaps it to system RAM
 const SWAP_SLOWDOWN_FACTOR: f64 = 3.0;
@@ -590,6 +592,7 @@ struct RunReport {
     /// tested at least the standard 5 minutes, or the shorter duration asked for
     completed: bool,
     stopped_by_user: bool,
+    stopped_on_error: bool,
 }
 
 /// Sets up the device and runs the test on it; never returns
@@ -909,6 +912,9 @@ fn test_device<Writer: std::io::Write>(
         }
     )?;
 
+    if std::io::stdout().is_terminal() {
+        log_dupler.enable_live_line();
+    }
     let report = main_loop(
         tester,
         log_dupler,
@@ -980,6 +986,40 @@ fn find_slow_windows(read_times: &[Duration], had_errors: &[bool]) -> Option<(Ve
         .collect();
     let slowest = slow.iter().map(|&i| read_times[i]).max()?;
     Some((slow, slowest.as_secs_f64() / fastest.as_secs_f64()))
+}
+
+/// The progress line shown in place on the console, like
+/// `  2:35 / 5:00  [##########----------]  52%   186.2GB/s  no errors`
+fn progress_text(
+    elapsed: Duration,
+    target: Option<Duration>,
+    write_gbps: f64,
+    error_state: &str,
+) -> String {
+    const BAR_WIDTH: usize = 20;
+    let speed = if write_gbps > 0.0 {
+        format!("{write_gbps:6.1}GB/s")
+    } else {
+        " ".repeat(10)
+    };
+    match target {
+        Some(target) => {
+            let done = (elapsed.as_secs_f64() / target.as_secs_f64().max(1.0)).min(1.0);
+            let filled = (done * BAR_WIDTH as f64).round() as usize;
+            format!(
+                "  {} / {}  [{}{}] {:3.0}%  {speed}  {error_state}",
+                format_duration(elapsed),
+                format_duration(target),
+                "#".repeat(filled),
+                "-".repeat(BAR_WIDTH - filled),
+                done * 100.0
+            )
+        }
+        None => format!(
+            "  {} / endless  {speed}  {error_state}",
+            format_duration(elapsed)
+        ),
+    }
 }
 
 /// Status of the errors found, for the progress lines
@@ -1112,8 +1152,21 @@ fn main_loop<Writer: std::io::Write>(
     // per-window read time and errors in the current report period, to spot windows not in VRAM
     let mut window_read_times = vec![Duration::ZERO; window_count];
     let mut window_had_errors = vec![false; window_count];
+    let stop_on_error = env.options.stop_on_error;
+    let mut stopped_on_error = false;
+    let mut alerted = false;
+    let mut last_live_update: Option<Instant> = None;
+    if last_error_at.is_some() {
+        // errors found already by the initial fill
+        crate::alert::alert();
+        alerted = true;
+        stopped_on_error = stop_on_error;
+    }
 
     'test: for iteration in 1.. {
+        if stopped_on_error {
+            break;
+        }
         // write all windows except window 0, which keeps the initial data to check retention
         for window_idx in 1..window_count {
             if !tester.is_active(window_idx) {
@@ -1154,6 +1207,10 @@ fn main_loop<Writer: std::io::Write>(
                 )?;
                 let pause_start = Instant::now();
                 while pause_start.elapsed() < LOAD_PAUSE {
+                    log_dupler.show_live_line(&format!(
+                        "  Pausing the GPU load: {}s left",
+                        (LOAD_PAUSE - pause_start.elapsed()).as_secs() + 1
+                    ));
                     std::thread::sleep(Duration::from_millis(250));
                     if close::close_requested() {
                         stop_requested = true;
@@ -1195,6 +1252,14 @@ fn main_loop<Writer: std::io::Write>(
                 if tester.report_errors(log_dupler, &mut totals, &io_out, window_idx, mode)? {
                     last_error_at = Some(start.elapsed());
                     window_had_errors[window_idx] = true;
+                    if !alerted {
+                        crate::alert::alert();
+                        alerted = true;
+                    }
+                    if stop_on_error {
+                        stopped_on_error = true;
+                        break 'test;
+                    }
                 }
                 if close::close_requested() {
                     stop_requested = true;
@@ -1266,10 +1331,28 @@ fn main_loop<Writer: std::io::Write>(
         if target_reached {
             break;
         }
+        // progress shown in place on the console, a few times per second
+        if last_live_update.is_none_or(|at| at.elapsed() >= LIVE_UPDATE_INTERVAL) {
+            last_live_update = Some(Instant::now());
+            log_dupler.show_live_line(&progress_text(
+                start.elapsed(),
+                target,
+                period.write_gbps(),
+                &error_state(&totals, last_error_at),
+            ));
+        }
     }
     total.add(&period);
     if stop_requested {
         writeln!(log_dupler, "Testing stopped by Ctrl+C.")?;
+    }
+    if stopped_on_error {
+        writeln!(
+            log_dupler,
+            "Testing stopped at the first error (--stop-on-error)."
+        )?;
+        // the test ended as asked, not unexpectedly
+        close::raise_status_bit(close::app_status::COMPLETED);
     }
     // stopping an endless or long test after the standard 5 minutes still gives a full result
     let elapsed = start.elapsed();
@@ -1284,7 +1367,25 @@ fn main_loop<Writer: std::io::Write>(
         skipped_windows,
         completed: target_reached || elapsed >= required,
         stopped_by_user: stop_requested,
+        stopped_on_error,
     })
+}
+
+/// What to do after the test, for each kind of result
+fn next_steps(totals: &ErrorTotals, completed: bool) -> &'static str {
+    if totals.unwritten > 0 {
+        "Retry with --window-mb 512, or update or change the GPU driver, and see Troubleshooting\n\
+         in the README. Faulty VRAM gives scattered errors, not this pattern."
+    } else if totals.memory_errors > 0 {
+        "If the GPU memory is overclocked or undervolted, go back to stock settings and test again.\n\
+         If errors remain at stock settings, check the GPU temperatures and cooling. Errors at\n\
+         stock settings and normal temperatures point to faulty VRAM."
+    } else if completed {
+        "Nothing to fix. When tuning an overclock, this setting passed: you can try the next\n\
+         step, and confirm the final setting with a longer test, like --duration 1h."
+    } else {
+        "Run the full test (the standard 5 minutes or longer) for a reliable result."
+    }
 }
 
 fn write_summary<Writer: std::io::Write>(
@@ -1307,7 +1408,7 @@ fn write_summary<Writer: std::io::Write>(
         report.iterations,
         format_duration(report.elapsed),
         match env.options.duration {
-            TestDuration::Limited(target) if report.stopped_by_user => {
+            TestDuration::Limited(target) if report.stopped_by_user || report.stopped_on_error => {
                 format!(" of {} planned", format_duration(target))
             }
             _ => String::new(),
@@ -1336,7 +1437,7 @@ fn write_summary<Writer: std::io::Write>(
         result
     } else if totals.memory_errors > 0 {
         format!(
-            "FAILED - {} wrong value{} in {} check{}{}",
+            "FAILED - {} wrong value{} in {} check{}{}{}",
             totals.memory_errors,
             if totals.memory_errors == 1 { "" } else { "s" },
             totals.error_passes,
@@ -1344,7 +1445,12 @@ fn write_summary<Writer: std::io::Write>(
             report
                 .last_error_at
                 .map(|at| format!(", last at {}", format_duration(at)))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if report.stopped_on_error {
+                ", stopped at the first error"
+            } else {
+                ""
+            }
         )
     } else if report.completed
         && report.stopped_by_user
@@ -1362,6 +1468,11 @@ fn write_summary<Writer: std::io::Write>(
     {
         writeln!(log_dupler, "Likely cause: {cause}")?;
     }
+    writeln!(
+        log_dupler,
+        "Next steps: {}",
+        next_steps(totals, report.completed).replace('\n', "\n            ")
+    )?;
     if !report.skipped_windows.is_empty() {
         writeln!(
             log_dupler,
@@ -1435,6 +1546,49 @@ mod tests {
             windows_to_drop(&[1, 2], &[true, false, true, true]),
             vec![2]
         );
+    }
+
+    #[test]
+    fn progress_line_shows_time_bar_and_status() {
+        let line = progress_text(
+            Duration::from_secs(150),
+            Some(Duration::from_secs(300)),
+            186.24,
+            "no errors",
+        );
+        assert!(line.contains("2:30 / 5:00"), "{line}");
+        assert!(line.contains("[##########----------]  50%"), "{line}");
+        assert!(line.contains("186.2GB/s  no errors"), "{line}");
+        assert!(line.len() < 80, "{line}");
+        let endless = progress_text(
+            Duration::from_secs(61),
+            None,
+            0.0,
+            "ERRORS: 3 (last at 0:42)",
+        );
+        assert!(endless.contains("1:01 / endless"), "{endless}");
+        assert!(!endless.contains("GB/s"), "{endless}");
+        let overtime = progress_text(
+            Duration::from_secs(400),
+            Some(Duration::from_secs(300)),
+            1.0,
+            "",
+        );
+        assert!(
+            overtime.contains("[####################] 100%"),
+            "{overtime}"
+        );
+    }
+
+    #[test]
+    fn next_steps_match_the_result() {
+        let mut totals = ErrorTotals::default();
+        assert!(next_steps(&totals, true).contains("Nothing to fix"));
+        assert!(next_steps(&totals, false).contains("full test"));
+        totals.memory_errors = 3;
+        assert!(next_steps(&totals, true).contains("stock settings"));
+        totals.unwritten = 100;
+        assert!(next_steps(&totals, true).contains("--window-mb 512"));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! worker process (the same executable started with --worker). If the driver fails while
 //! allocating, the worker exits and the console retries with less memory.
 
+mod alert;
 mod cli;
 mod close;
 mod devices;
@@ -185,6 +186,9 @@ fn run_worker<Writer: std::io::Write>(
         .arg(options.duration.to_arg());
     if let Some(window_mb) = options.window_mb {
         command.arg("--window-mb").arg(window_mb.to_string());
+    }
+    if options.stop_on_error {
+        command.arg("--stop-on-error");
     }
     match &env.log_path {
         Some(log_path) => command.arg("--log").arg(log_path),

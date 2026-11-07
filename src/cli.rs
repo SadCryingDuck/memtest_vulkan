@@ -47,6 +47,8 @@ pub struct Options {
     /// Maximum size of one test window, in megabytes
     pub window_mb: Option<i64>,
     pub log: LogTarget,
+    /// End the test at the first error found
+    pub stop_on_error: bool,
     pub verbose: bool,
     /// No prompts or key waits
     pub batch: bool,
@@ -80,6 +82,7 @@ Options:
                          they come from the driver, not from the memory
       --log <FILE>       Log file (default: memtest_vulkan.log in the current folder)
       --no-log           Don't write a log file
+  -e, --stop-on-error    End the test at the first error, like when tuning an overclock
   -l, --list             List the GPUs and exit
   -b, --batch            No prompts and no key press at the end, for scripts
   -v, --verbose          Print diagnostic information
@@ -242,6 +245,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             }
             "--log" => options.log = LogTarget::File(PathBuf::from(value("a file name")?)),
             "--no-log" => options.log = LogTarget::Disabled,
+            "-e" | "--stop-on-error" => options.stop_on_error = true,
             "-l" | "--list" => options.list = true,
             "-b" | "--batch" => options.batch = true,
             "-v" | "--verbose" => options.verbose = true,
@@ -284,7 +288,9 @@ mod tests {
             "x.log",
             "-b",
             "-v",
+            "-e",
         ]);
+        assert!(options.stop_on_error);
         assert_eq!(options.device, Some(2));
         assert_eq!(options.size, Some(1536 * 1024 * 1024));
         assert_eq!(
