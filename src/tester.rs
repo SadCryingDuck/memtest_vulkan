@@ -14,6 +14,7 @@ use crate::{
         TEST_WINDOW_1D_MAX_GROUPS, TEST_WINDOW_MAX_SIZE, TEST_WINDOW_SIZE_GRANULARITY, VEC_SIZE,
         WG_SIZE, WRITE_MARKER,
     },
+    text,
     vk_util::{MapErrRetryWithLowerMemory, MapErrStr, NO_EXTENSIONS_ARRAY},
 };
 
@@ -519,19 +520,23 @@ impl<'a> Tester<'a> {
             io_out
         )?;
         if let Some(evidence) = unwritten {
+            let message = format!(
+                "0x{unwritten_words:X} of these wrong values {}. The test's writes never reached \
+                 this memory. This is most likely a GPU driver or memtest_vulkan problem rather than \
+                 faulty VRAM. Retry with --window-mb 512 or another driver version; if it persists, \
+                 the GPU itself may be faulty.",
+                evidence.reason()
+            );
             writeln!(
                 log_dupler,
-                "WRITES NOT APPLIED: 0x{unwritten_words:X} of these wrong values {}.\n\
-                 The test's writes never reached this memory. This is most likely a GPU driver or memtest_vulkan\n\
-                 problem rather than faulty VRAM. Retry with --window-mb 512 or another driver version;\n\
-                 if it persists, the GPU itself may be faulty.",
-                evidence.reason()
+                "{}",
+                text::wrap("WRITES NOT APPLIED: ", &message)
             )?;
         } else {
             let mut this_pass = ErrorTotals::default();
             this_pass.add(io_out);
             if let Some(cause) = this_pass.likely_cause() {
-                writeln!(log_dupler, "Likely cause: {cause}")?;
+                writeln!(log_dupler, "{}", text::wrap("Likely cause: ", &cause))?;
             }
         }
         Ok(true)
@@ -1030,7 +1035,7 @@ fn error_state(totals: &ErrorTotals, last_error_at: Option<Duration>) -> String 
     match last_error_at {
         None => "no errors".to_owned(),
         Some(at) => format!(
-            "ERRORS: {} (last at {})",
+            "ERRORS: {} (last {})",
             totals.memory_errors + totals.unwritten,
             format_duration(at)
         ),
@@ -1080,17 +1085,17 @@ fn handle_slow_windows<Writer: std::io::Write>(
             tester.drop_window(window_idx);
         }
         skipped_windows.extend(&droppable);
-        writeln!(
-            log_dupler,
-            "Test window{} {} of {total_windows} ({:.1}GB) read {slowdown:.0}x slower than the others: the driver\n\
-             placed that memory in system RAM, most likely because other programs use the VRAM.\n\
-             Testing continues without it, on {:.1}GB. Close other programs using the GPU (browsers,\n\
-             Discord, games, overlays) to test more of the VRAM.",
+        let message = format!(
+            "Test window{} {} of {total_windows} ({:.1}GB) read {slowdown:.0}x slower than the \
+             others: the driver placed that memory in system RAM, most likely because other \
+             programs use the VRAM. Testing continues without it, on {:.1}GB. Close other \
+             programs using the GPU (browsers, Discord, games, overlays) to test more of the VRAM.",
             if droppable.len() > 1 { "s" } else { "" },
             window_numbers(&droppable),
             droppable.len() as f32 * window_gb,
             tester.tested_bytes() as f32 / GB,
-        )?;
+        );
+        writeln!(log_dupler, "{}", text::wrap("", &message))?;
     }
     let kept: Vec<usize> = slow
         .iter()
@@ -1101,10 +1106,10 @@ fn handle_slow_windows<Writer: std::io::Write>(
         return Ok(None);
     }
     Ok(Some(format!(
-        "test window{} {} of {total_windows} ({:.1}GB) read{} {slowdown:.0}x slower than the others.\n\
-         The driver most likely placed that memory in system RAM because other programs use the\n\
-         VRAM, so that part of the test checks system RAM instead of VRAM. Close other programs\n\
-         using the GPU (browsers, Discord, games, overlays) or test less memory with --size.",
+        "test window{} {} of {total_windows} ({:.1}GB) read{} {slowdown:.0}x slower than the \
+         others. The driver most likely placed that memory in system RAM because other programs \
+         use the VRAM, so that part of the test checks system RAM instead of VRAM. Close other \
+         programs using the GPU (browsers, Discord, games, overlays) or test less memory with --size.",
         if kept.len() > 1 { "s" } else { "" },
         window_numbers(&kept),
         kept.len() as f32 * window_gb,
@@ -1284,14 +1289,14 @@ fn main_loop<Writer: std::io::Write>(
                     handle_slow_windows(tester, log_dupler, &slow, slowdown, &mut skipped_windows)?
                 && swap_warning.is_none()
             {
-                writeln!(log_dupler, "WARNING: {warning}")?;
+                writeln!(log_dupler, "{}", text::wrap("WARNING: ", &warning))?;
                 swap_warning = Some(warning);
             }
             window_read_times.fill(Duration::ZERO);
             window_had_errors.fill(false);
             writeln!(
                 log_dupler,
-                "{:>8} / {:<8} written:{:7.1}GB{:7.1}GB/s   checked:{:7.1}GB{:7.1}GB/s   {}",
+                "{:>7} / {:<7}  written:{:7.1}GB{:7.1}GB/s  checked:{:7.1}GB{:6.1}GB/s  {}",
                 format_duration(elapsed),
                 format_test_duration(duration),
                 period.written as f32 / GB,
@@ -1374,14 +1379,14 @@ fn main_loop<Writer: std::io::Write>(
 /// What to do after the test, for each kind of result
 fn next_steps(totals: &ErrorTotals, completed: bool) -> &'static str {
     if totals.unwritten > 0 {
-        "Retry with --window-mb 512, or update or change the GPU driver, and see Troubleshooting\n\
+        "Retry with --window-mb 512, or update or change the GPU driver, and see Troubleshooting \
          in the README. Faulty VRAM gives scattered errors, not this pattern."
     } else if totals.memory_errors > 0 {
-        "If the GPU memory is overclocked or undervolted, go back to stock settings and test again.\n\
-         If errors remain at stock settings, check the GPU temperatures and cooling. Errors at\n\
-         stock settings and normal temperatures point to faulty VRAM."
+        "If the GPU memory is overclocked or undervolted, go back to stock settings and test \
+         again. If errors remain at stock settings, check the GPU temperatures and cooling. \
+         Errors at stock settings and normal temperatures point to faulty VRAM."
     } else if completed {
-        "Nothing to fix. When tuning an overclock, this setting passed: you can try the next\n\
+        "Nothing to fix. When tuning an overclock, this setting passed: you can try the next \
          step, and confirm the final setting with a longer test, like --duration 1h."
     } else {
         "Run the full test (the standard 5 minutes or longer) for a reliable result."
@@ -1424,15 +1429,12 @@ fn write_summary<Writer: std::io::Write>(
     )?;
     let result = if totals.unwritten > 0 {
         let mut result = format!(
-            "INVALID - {} values the test wrote never reached the memory. Most likely a GPU driver\n            \
-             or memtest_vulkan problem rather than faulty VRAM: retry with --window-mb 512 or another driver.",
+            "INVALID - {} values the test wrote never reached the memory. Most likely a GPU \
+             driver or memtest_vulkan problem rather than faulty VRAM.",
             totals.unwritten
         );
         if totals.memory_errors > 0 {
-            result += &format!(
-                "\n            Also found {} other wrong values.",
-                totals.memory_errors
-            );
+            result += &format!(" Also found {} other wrong values.", totals.memory_errors);
         }
         result
     } else if totals.memory_errors > 0 {
@@ -1462,32 +1464,29 @@ fn write_summary<Writer: std::io::Write>(
     } else {
         "INCOMPLETE - stopped early, no errors found so far".to_owned()
     };
-    writeln!(log_dupler, "Result:     {result}")?;
+    // labels are 12 characters wide, wrapped lines continue under the text after them
+    writeln!(log_dupler, "{}", text::wrap("Result:     ", &result))?;
     if let Some(cause) = totals.likely_cause()
         && totals.unwritten == 0
     {
-        writeln!(log_dupler, "Likely cause: {cause}")?;
+        writeln!(log_dupler, "{}", text::wrap("Cause:      ", &cause))?;
     }
     writeln!(
         log_dupler,
-        "Next steps: {}",
-        next_steps(totals, report.completed).replace('\n', "\n            ")
+        "{}",
+        text::wrap("Next steps: ", next_steps(totals, report.completed))
     )?;
     if !report.skipped_windows.is_empty() {
-        writeln!(
-            log_dupler,
-            "Skipped:    {:.1}GB (window {}) the driver placed in system RAM, as other programs use the VRAM.\n            \
-             Close other programs using the GPU to test it too.",
+        let skipped = format!(
+            "{:.1}GB (window {}) the driver placed in system RAM, as other programs use the \
+             VRAM. Close other programs using the GPU to test it too.",
             report.skipped_windows.len() as f32 * tester.window_size as f32 / GB,
             window_numbers(&report.skipped_windows)
-        )?;
+        );
+        writeln!(log_dupler, "{}", text::wrap("Skipped:    ", &skipped))?;
     }
     if let Some(warning) = &report.swap_warning {
-        writeln!(
-            log_dupler,
-            "Warning:    {}",
-            warning.replace('\n', "\n            ")
-        )?;
+        writeln!(log_dupler, "{}", text::wrap("Warning:    ", warning))?;
     }
     if let Some(log_path) = &env.log_path {
         writeln!(log_dupler, "Log file:   {}", log_path.display())?;
@@ -1560,12 +1559,7 @@ mod tests {
         assert!(line.contains("[##########----------]  50%"), "{line}");
         assert!(line.contains("186.2GB/s  no errors"), "{line}");
         assert!(line.len() < 80, "{line}");
-        let endless = progress_text(
-            Duration::from_secs(61),
-            None,
-            0.0,
-            "ERRORS: 3 (last at 0:42)",
-        );
+        let endless = progress_text(Duration::from_secs(61), None, 0.0, "ERRORS: 3 (last 0:42)");
         assert!(endless.contains("1:01 / endless"), "{endless}");
         assert!(!endless.contains("GB/s"), "{endless}");
         let overtime = progress_text(

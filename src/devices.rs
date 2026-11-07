@@ -144,14 +144,18 @@ impl NamedComputeDevice {
         if let Some(memory) = limited_by
             && env.options.size.is_none()
         {
-            let _ = writeln!(
-                log_dupler,
-                "Integrated GPU: testing up to {:.1}GB of system RAM, leaving {:.1}GB for the system\n\
-                 ({:.1}GB of {:.1}GB available now). Use --size to change it.",
+            let note = format!(
+                "testing up to {:.1}GB of system RAM, leaving {:.1}GB for the system ({:.1}GB of \
+                 {:.1}GB available now). Use --size to change it.",
                 max(max_budget, 0) as f32 / GB,
                 memory.reserve_for_system() as f32 / GB,
                 memory.available as f32 / GB,
                 memory.total as f32 / GB,
+            );
+            let _ = writeln!(
+                log_dupler,
+                "{}",
+                crate::text::wrap("Integrated GPU: ", &note)
             );
         }
         max_budget

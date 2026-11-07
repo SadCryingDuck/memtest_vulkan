@@ -16,6 +16,7 @@ mod ram;
 mod shader;
 mod start_screen;
 mod tester;
+mod text;
 mod vk_util;
 
 pub use erupt::{CustomEntryLoader, LoaderError}; // republish for vendored part
@@ -324,13 +325,14 @@ fn select_device_and_test<Writer: std::io::Write>(
         match env.options.size {
             Some(size) => {
                 if estimate > 0 && size > estimate {
-                    let _ = writeln!(
-                        log_dupler,
-                        "WARNING: --size {:.1}GB is more than the {:.1}GB of memory estimated to be free.\n\
-                         Part of the test memory may be swapped, so that part wouldn't check the GPU memory.",
+                    let warning = format!(
+                        "--size {:.1}GB is more than the {:.1}GB of memory estimated to be free. \
+                         Part of the test memory may be swapped, so that part wouldn't check the \
+                         GPU memory.",
                         size as f32 / GB,
                         estimate as f32 / GB
                     );
+                    let _ = writeln!(log_dupler, "{}", text::wrap("WARNING: ", &warning));
                 }
                 env.set_mem_budget_limit(size);
             }
@@ -414,7 +416,12 @@ fn init_running_env() -> ProcessEnv {
         drop(color_setter);
         println!("  {}", env!("CARGO_PKG_REPOSITORY"));
         println!(
-            "Based on memtest_vulkan by GpuZelenograd. Press Ctrl+C to stop testing early, see --help for options."
+            "{}",
+            text::wrap(
+                "",
+                "Based on memtest_vulkan by GpuZelenograd. Press Ctrl+C to stop testing early, \
+                 see --help for options."
+            )
         );
     }
     process_env
@@ -436,11 +443,11 @@ pub fn display_this_process_result(
 fn outcome(status: u8) -> (u32, String, Option<bool>) {
     use close::{app_status::*, check_any_bits_set as has};
     if has(status, WRITES_NOT_APPLIED) {
-        let mut message = "memtest_vulkan: RESULTS INVALID - test writes didn't reach the memory.\n\
+        let mut message = "memtest_vulkan: RESULTS INVALID - test writes didn't reach the memory. \
              Most likely a GPU driver or memtest_vulkan problem rather than faulty VRAM - see the log."
             .to_owned();
         if has(status, RUNTIME_ERRORS) {
-            message += "\nOther memory errors were found as well.";
+            message += " Other memory errors were found as well.";
         }
         (exit_code::WRITES_NOT_APPLIED, message, Some(true))
     } else if has(status, RUNTIME_ERRORS) {
@@ -487,7 +494,7 @@ fn display_testing_outcome(status: u8, env: &ProcessEnv) -> ! {
     if let Some(failed) = failed {
         key_reader.set_pass_fail_accent_color(failed);
     }
-    println!("{message}");
+    println!("{}", text::wrap("", &message));
     if env.wait_for_key() {
         key_reader.wait_any_key(true);
     }
