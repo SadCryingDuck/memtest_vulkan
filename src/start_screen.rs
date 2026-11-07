@@ -208,24 +208,30 @@ impl<'a> Menu<'a> {
         self.selected = ROWS.iter().position(|r| *r == row).unwrap_or(0);
     }
 
+    /// Selects the GPU with this index, dropping a fixed memory size that doesn't fit it
+    fn choose_device(&mut self, device: usize) {
+        self.settings.device = device;
+        if self
+            .settings
+            .size
+            .is_some_and(|size| size >= self.devices[device].testable)
+        {
+            self.settings.size = None;
+        }
+    }
+
     /// Changes the value of `row` one step forward or back
     fn step(&mut self, row: Row, forward: bool) {
         let settings = &mut self.settings;
         match row {
             Row::Gpu => {
                 let count = self.devices.len();
-                settings.device = if forward {
+                let device = if forward {
                     (settings.device + 1) % count
                 } else {
                     (settings.device + count - 1) % count
                 };
-                // a fixed size may not fit the other GPU
-                if settings
-                    .size
-                    .is_some_and(|size| size >= self.devices[settings.device].testable)
-                {
-                    settings.size = None;
-                }
+                self.choose_device(device);
             }
             Row::Duration => settings.duration = step_duration(settings.duration, forward),
             Row::Memory => {
@@ -249,9 +255,7 @@ impl<'a> Menu<'a> {
             Row::Gpu => {
                 let number = value as usize;
                 if value.fract() == 0.0 && (1..=self.devices.len()).contains(&number) {
-                    self.settings.device = number - 1;
-                    self.step(Row::Gpu, true);
-                    self.step(Row::Gpu, false); // drops a fixed size that doesn't fit
+                    self.choose_device(number - 1);
                 } else {
                     self.message = Some(format!("There's no GPU {text}"));
                 }
@@ -717,6 +721,24 @@ mod tests {
             lines[3].starts_with("> E  Stop at first error  yes"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn typed_gpu_keeps_a_size_that_fits_it() {
+        let devices = devices();
+        // 8GB fits GPU 1 (10.7GB testable) but not GPU 2 (5GB)
+        let settings = Settings {
+            size: Some(8 * GIB),
+            ..defaults()
+        };
+        let mut menu = Menu::new(&devices, settings);
+        press(&mut menu, &[Key::Char('1'), Key::Enter]);
+        assert_eq!(
+            (menu.settings.device, menu.settings.size),
+            (0, Some(8 * GIB))
+        );
+        press(&mut menu, &[Key::Char('2'), Key::Enter]);
+        assert_eq!((menu.settings.device, menu.settings.size), (1, None));
     }
 
     #[test]
