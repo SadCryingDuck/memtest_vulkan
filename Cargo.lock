@@ -219,7 +219,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "memtest_vulkan"
-version = "0.11.2-duck"
+version = "0.12.0-duck"
 dependencies = [
  "ash",
  "chrono",
