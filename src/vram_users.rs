@@ -29,6 +29,8 @@ pub fn dedicated_users(_luid: [u8; 8]) -> Option<Vec<(String, u64)>> {
     None
 }
 
+// used by the Windows code only
+#[cfg(any(windows, test))]
 /// The part of the performance counter instance names identifying the GPU, like
 /// `luid_0x00000000_0x0000cd9b` in `pid_1304_luid_0x00000000_0x0000cd9b_phys_0`
 fn luid_instance_tag(luid: [u8; 8]) -> String {
@@ -38,6 +40,8 @@ fn luid_instance_tag(luid: [u8; 8]) -> String {
     format!("luid_0x{high:08x}_0x{low:08x}")
 }
 
+// used by the Windows code only
+#[cfg(any(windows, test))]
 /// The process ID of a counter instance of the GPU identified by `tag`
 fn pid_of_instance(instance: &str, tag: &str) -> Option<u32> {
     let instance = instance.to_ascii_lowercase();
@@ -47,6 +51,8 @@ fn pid_of_instance(instance: &str, tag: &str) -> Option<u32> {
     pid.parse().ok()
 }
 
+// used by the Windows code only
+#[cfg(any(windows, test))]
 /// A readable name for a program from its executable file name
 fn friendly_name(exe: &str) -> String {
     let name = match exe.rsplit_once('.') {
@@ -60,6 +66,8 @@ fn friendly_name(exe: &str) -> String {
     }
 }
 
+// used by the Windows code only
+#[cfg(any(windows, test))]
 /// Adds up the usage of programs with the same name (like the processes of a browser),
 /// largest first
 fn group_by_name(usage: impl Iterator<Item = (String, u64)>) -> Vec<(String, u64)> {
