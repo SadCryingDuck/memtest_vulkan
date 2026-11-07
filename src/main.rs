@@ -76,6 +76,10 @@ impl ProcessEnv {
         self.verbose_requested.store(true, SeqCst)
     }
 
+    fn set_verbose(&self, verbose: bool) {
+        self.verbose_requested.store(verbose, SeqCst)
+    }
+
     pub fn max_test_bytes(&self) -> i64 {
         self.max_test_bytes.load(SeqCst)
     }
@@ -259,6 +263,8 @@ fn choose_settings<Writer: std::io::Write>(
         duration: env.options.duration,
         size: env.options.size,
         stop_on_error: env.options.stop_on_error,
+        window_mb: env.options.window_mb,
+        verbose: env.verbose(),
     };
     // more time to read the list and pick when there are several GPUs
     let countdown = time::Duration::from_secs(if choices.len() > 1 { 10 } else { 5 });
@@ -276,6 +282,9 @@ fn choose_settings<Writer: std::io::Write>(
             env.options.duration = settings.duration;
             env.options.size = settings.size;
             env.options.stop_on_error = settings.stop_on_error;
+            env.options.window_mb = settings.window_mb;
+            env.options.verbose = settings.verbose;
+            env.set_verbose(settings.verbose);
             Ok(())
         }
     }

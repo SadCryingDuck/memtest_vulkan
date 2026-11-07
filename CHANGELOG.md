@@ -12,6 +12,11 @@ Changes in SadCryingDuck's fork of memtest_vulkan. Each release's notes on GitHu
   - `pulsed`: bursts of load with idle gaps, like the uneven load of games.
   - `standard` is still the default and works as before.
 - Error reports name the pattern and access order that found the error.
+- The pulsed test is marked experimental: it's a different kind of stress, but whether it finds errors the other tests miss varies by card.
+
+### Advanced settings
+- The start screen's settings have an advanced part for diagnosing problems: the test window size (`--window-mb`) and diagnostic output (`--verbose`), so they're available without the command line too.
+- The Vulkan validation layer, a developer tool that comes with the Vulkan SDK, is only used with diagnostic output. Before, it was turned on for every test on PCs with the SDK installed, which slows the test down.
 
 ### Testing more of the VRAM
 - The test memory is split into windows of 512MB to 1GB instead of up to 3.9GB. When the driver places part of the test in system RAM because other programs use the VRAM, only that window is dropped. Before, a big window could stay in the test, so part of the run checked system RAM instead of VRAM.

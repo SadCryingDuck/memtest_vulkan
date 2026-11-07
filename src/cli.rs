@@ -83,7 +83,7 @@ impl TestMode {
             Self::Thorough => "all test types in turn, then a longer hold",
             Self::Bus => "bus-toggling patterns",
             Self::Random => "random access order",
-            Self::Pulsed => "pulsed load",
+            Self::Pulsed => "pulsed load (experimental)",
         }
     }
 
@@ -158,6 +158,7 @@ Options:
                                      bus lines at once
                            random    all patterns in random access order
                            pulsed    all patterns in bursts of load
+                                     (experimental)
   -w, --window-mb <MB>   Limit one test window to MB megabytes (128MB steps,
                          default up to 1024). If errors disappear with small
                          windows, like 256, they come from the driver

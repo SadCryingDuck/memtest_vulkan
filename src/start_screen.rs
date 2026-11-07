@@ -31,6 +31,10 @@ pub struct Settings {
     /// memory to test, None for all free memory
     pub size: Option<i64>,
     pub stop_on_error: bool,
+    /// largest test window in MB (--window-mb), None for the default
+    pub window_mb: Option<i64>,
+    /// diagnostic output (--verbose)
+    pub verbose: bool,
 }
 
 /// A GPU offered on the screen
@@ -59,6 +63,9 @@ const DURATIONS: [TestDuration; 7] = [
 
 /// Memory sizes offered in the settings, below the default amount
 const SIZES_GB: [i64; 11] = [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+
+/// Test window sizes offered in the advanced settings, in MB: None is the default
+const WINDOW_SIZES: [Option<i64>; 4] = [None, Some(512), Some(256), Some(128)];
 
 /// Longest custom duration that can be typed, in minutes (a week)
 const MAX_CUSTOM_MINUTES: u64 = 7 * 24 * 60;
@@ -141,6 +148,29 @@ fn describe_test(settings: &Settings) -> String {
     }
 }
 
+/// What the selected test is for, shown under the settings
+fn test_hint(mode: TestMode) -> &'static str {
+    match mode {
+        TestMode::Standard => {
+            "Left/Right to choose: standard for quick checks, thorough for final checks"
+        }
+        TestMode::Thorough => {
+            "All test types in turn, then a longer hold: for final checks of an overclock or a \
+             suspect card"
+        }
+        TestMode::Bus => {
+            "Patterns switching the most memory bus lines at once: for memory overclocks"
+        }
+        TestMode::Random => {
+            "Random access order: stresses the memory timings rather than the speed"
+        }
+        TestMode::Pulsed => {
+            "Experimental: bursts of load like in games. Whether it finds more errors than the \
+             other tests varies by card"
+        }
+    }
+}
+
 /// The next (`forward`) or previous test mode, wrapping around
 fn step_mode(current: TestMode, forward: bool) -> TestMode {
     let count = TestMode::ALL.len();
@@ -193,15 +223,21 @@ enum Row {
     Duration,
     Memory,
     StopOnError,
+    WindowSize,
+    Diagnostics,
 }
 
-const ROWS: [Row; 5] = [
+const ROWS: [Row; 7] = [
     Row::Gpu,
     Row::Test,
     Row::Duration,
     Row::Memory,
     Row::StopOnError,
+    Row::WindowSize,
+    Row::Diagnostics,
 ];
+/// The advanced settings start at this row, under a heading
+const FIRST_ADVANCED_ROW: usize = 5;
 
 /// The settings menu: a highlighted row whose value arrows change, letter shortcuts, and typed
 /// custom values
@@ -286,6 +322,19 @@ impl<'a> Menu<'a> {
                 )
             }
             Row::StopOnError => settings.stop_on_error = !settings.stop_on_error,
+            Row::WindowSize => {
+                let count = WINDOW_SIZES.len();
+                let index = WINDOW_SIZES
+                    .iter()
+                    .position(|size| *size == settings.window_mb)
+                    .unwrap_or(0);
+                settings.window_mb = WINDOW_SIZES[if forward {
+                    (index + 1) % count
+                } else {
+                    (index + count - 1) % count
+                }];
+            }
+            Row::Diagnostics => settings.verbose = !settings.verbose,
         }
     }
 
@@ -327,7 +376,7 @@ impl<'a> Menu<'a> {
                     ));
                 }
             }
-            Row::Test | Row::StopOnError => {}
+            Row::Test | Row::StopOnError | Row::WindowSize | Row::Diagnostics => {}
         }
     }
 
@@ -363,9 +412,12 @@ impl<'a> Menu<'a> {
             Key::Down | Key::Tab => self.selected = (self.selected + 1) % ROWS.len(),
             Key::Left => self.step(self.row(), false),
             Key::Right => self.step(self.row(), true),
-            Key::Char(' ') if self.row() == Row::StopOnError => self.step(Row::StopOnError, true),
+            Key::Char(' ') if matches!(self.row(), Row::StopOnError | Row::Diagnostics) => {
+                self.step(self.row(), true)
+            }
             Key::Char(c)
-                if c.is_ascii_digit() && !matches!(self.row(), Row::Test | Row::StopOnError) =>
+                if c.is_ascii_digit()
+                    && matches!(self.row(), Row::Gpu | Row::Duration | Row::Memory) =>
             {
                 self.editing = Some(c.to_string())
             }
@@ -376,6 +428,8 @@ impl<'a> Menu<'a> {
                     'd' => Row::Duration,
                     'm' => Row::Memory,
                     'e' => Row::StopOnError,
+                    'w' => Row::WindowSize,
+                    'v' => Row::Diagnostics,
                     _ => return None,
                 };
                 self.select(row);
@@ -425,12 +479,33 @@ impl<'a> Menu<'a> {
                     "no"
                 }
             ),
+            format!(
+                "W  Test window size     {}",
+                match self.settings.window_mb {
+                    None => "auto (512MB to 1GB)".to_owned(),
+                    Some(mb) => format!("{mb}MB"),
+                }
+            ),
+            format!(
+                "V  Diagnostic output    {}",
+                if self.settings.verbose { "on" } else { "off" }
+            ),
         ];
-        let lines = rows
+        let mut lines: Vec<String> = rows
             .into_iter()
             .enumerate()
             .map(|(i, row)| format!("{} {row}", if i == self.selected { ">" } else { " " }))
             .collect();
+        lines.insert(
+            FIRST_ADVANCED_ROW,
+            "  Advanced, for diagnosing problems:".to_owned(),
+        );
+        // the heading isn't a row: the rows after it are one line further down
+        let selected_line = if self.selected >= FIRST_ADVANCED_ROW {
+            self.selected + 1
+        } else {
+            self.selected
+        };
         let hint = if let Some(message) = &self.message {
             message.clone()
         } else if self.editing.is_some() {
@@ -443,16 +518,22 @@ impl<'a> Menu<'a> {
         } else {
             match self.row() {
                 Row::Gpu => "Left/Right or type a number to choose the GPU",
-                Row::Test => {
-                    "Left/Right to choose: standard for quick checks, thorough for final checks"
-                }
+                Row::Test => test_hint(self.settings.mode),
                 Row::Duration => "Left/Right to change, or type a number of minutes",
                 Row::Memory => "Left/Right to change, or type a number of GB",
                 Row::StopOnError => "Left/Right or Space: end the test at the first error",
+                Row::WindowSize => {
+                    "Smaller windows tell driver problems from memory errors: if errors go away \
+                     with them, the driver is at fault"
+                }
+                Row::Diagnostics => {
+                    "Prints driver details. With the Vulkan SDK installed, also checks this \
+                     program's GPU calls (for developers, slower)"
+                }
             }
             .to_owned()
         };
-        (lines, self.selected, hint)
+        (lines, selected_line, hint)
     }
 }
 
@@ -750,6 +831,8 @@ mod tests {
             duration: TestDuration::default(),
             size: None,
             stop_on_error: false,
+            window_mb: None,
+            verbose: false,
         }
     }
 
@@ -776,12 +859,14 @@ mod tests {
                 duration: TestDuration::Endless,
                 size: Some(4 * GIB),
                 stop_on_error: true,
+                window_mb: None,
+                verbose: false,
             }))
         );
         // Up wraps from the first row to the last
         let mut menu = Menu::new(&devices, defaults());
         press(&mut menu, &[Key::Up, Key::Right]);
-        assert!(menu.settings.stop_on_error);
+        assert!(menu.settings.verbose);
     }
 
     #[test]
@@ -798,6 +883,59 @@ mod tests {
             lines[4].starts_with("> E  Stop at first error  yes"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn advanced_settings_sit_under_a_heading() {
+        let devices = devices();
+        let mut menu = Menu::new(&devices, defaults());
+        let (lines, _, _) = menu.lines();
+        assert_eq!(lines.len(), ROWS.len() + 1);
+        assert_eq!(lines[5], "  Advanced, for diagnosing problems:");
+        // W cycles the window size, wrapping back to the default
+        press(&mut menu, &[Key::Char('w')]);
+        assert_eq!(menu.settings.window_mb, Some(512));
+        let (lines, selected, hint) = menu.lines();
+        assert_eq!(
+            selected, 6,
+            "the heading moves the advanced rows down a line"
+        );
+        assert!(
+            lines[6].starts_with("> W  Test window size     512MB"),
+            "{lines:?}"
+        );
+        assert!(hint.contains("driver"), "{hint}");
+        press(&mut menu, &[Key::Right, Key::Right, Key::Right]);
+        assert_eq!(menu.settings.window_mb, None);
+        press(&mut menu, &[Key::Left]);
+        assert_eq!(menu.settings.window_mb, Some(128));
+        // V and Space switch the diagnostic output, digits don't start typing there
+        press(&mut menu, &[Key::Char('v')]);
+        assert!(menu.settings.verbose);
+        press(&mut menu, &[Key::Char(' '), Key::Char('5')]);
+        assert!(!menu.settings.verbose);
+        assert!(menu.editing.is_none());
+        let (lines, selected, _) = menu.lines();
+        assert_eq!(selected, 7);
+        assert!(
+            lines[7].starts_with("> V  Diagnostic output    off"),
+            "{lines:?}"
+        );
+        // Down wraps from the last row to the first
+        press(&mut menu, &[Key::Down]);
+        assert_eq!(menu.lines().1, 0);
+    }
+
+    #[test]
+    fn the_pulsed_test_is_marked_experimental() {
+        let devices = devices();
+        let mut menu = Menu::new(&devices, defaults());
+        // T steps to thorough, then back past standard to the last test, pulsed
+        press(&mut menu, &[Key::Char('t'), Key::Left, Key::Left]);
+        assert_eq!(menu.settings.mode, TestMode::Pulsed);
+        let (lines, _, hint) = menu.lines();
+        assert!(lines[1].ends_with("(experimental)"), "{lines:?}");
+        assert!(hint.starts_with("Experimental:"), "{hint}");
     }
 
     #[test]
