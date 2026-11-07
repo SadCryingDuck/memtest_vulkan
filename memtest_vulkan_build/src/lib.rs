@@ -4,24 +4,25 @@ use proc_macro::TokenStream;
 struct InlineSpirV(TokenStream);
 
 fn naga_compile(src: &str) -> Result<Vec<u32>, String> {
-    use naga::{
-        front::wgsl::Parser,
-        valid::{Capabilities, ValidationFlags, Validator},
-    };
+    use naga::valid::{Capabilities, ValidationFlags, Validator};
 
-    let module = Parser::new().parse(src);
-    let module = module.map_err(|e| e.emit_to_string(src))?;
+    let module = naga::front::wgsl::parse_str(src).map_err(|e| e.emit_to_string(src))?;
 
     let opts = naga::back::spv::Options {
         lang_version: (1, 3), // Vulkan 1.1 must support spirv 1.3
         flags: naga::back::spv::WriterFlags::DEBUG,
+        // no out-of-bounds checks: every index is in bounds by construction, and checks would
+        // slow down the memory accesses being tested
+        bounds_check_policies: naga::proc::BoundsCheckPolicies::default(),
+        // the shader loops are bounded already, extra loop counters would only add work
+        force_loop_bounding: false,
         ..Default::default()
     };
 
     // Attempt to validate WGSL, error if invalid
     let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
         .validate(&module)
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| e.emit_to_string(src))?;
     let spv =
         naga::back::spv::write_vec(&module, &info, &opts, None).map_err(|e| format!("{:?}", e))?;
     Ok(spv)

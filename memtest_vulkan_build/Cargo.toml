@@ -4,8 +4,8 @@ name = 'memtest_vulkan_build'
 version = '0.0.0'
 
 [dependencies]
-quote = '1.0'
-syn = '2.0'
+quote = '1.0.47'
+syn = { version = '3.0.9', default-features = false, features = ['parsing', 'proc-macro'] }
 
 [dependencies.naga]
 default-features = false
@@ -13,7 +13,7 @@ features = [
     'wgsl-in',
     'spv-out',
 ]
-version = '0.10.1'
+version = '30.0.1'
 
 [lib]
 proc-macro = true

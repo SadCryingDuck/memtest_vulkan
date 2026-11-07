@@ -3,20 +3,22 @@
 pub const GB: f32 = (1024 * 1024 * 1024) as f32;
 pub const READ_SHADER: &[u32] = memtest_vulkan_build::compiled_vk_compute_spirv!(
     r#"
+// Same layout as IOBuf on the CPU side. The counters the read shader updates from many
+// invocations at once are atomic; atomic<u32> has the same size and alignment as u32.
 struct IOBuf
 {
-    err_bit1_idx: array<u32, 32>,
-    err_bitcount: array<u32, 32>,
-    mem_bitcount: array<u32, 32>,
-    actual_ff: u32,
-    actual_max: u32,
-    actual_min: u32,
-    idx_max: u32,
-    idx_min: u32,
-    done_iter_or_err: u32,
+    err_bit1_idx: array<atomic<u32>, 32>,
+    err_bitcount: array<atomic<u32>, 32>,
+    mem_bitcount: array<atomic<u32>, 32>,
+    actual_ff: atomic<u32>,
+    actual_max: atomic<u32>,
+    actual_min: atomic<u32>,
+    idx_max: atomic<u32>,
+    idx_min: atomic<u32>,
+    done_iter_or_err: atomic<u32>,
     iter: u32,
     calc_param: u32,
-    unwritten_count: u32,
+    unwritten_count: atomic<u32>,
     prev_calc_param: u32,
     stale_mode: u32,
     xor_mask: u32,
@@ -27,7 +29,7 @@ struct IOBuf
 @group(0) @binding(1) var<storage, read_write> test: array<vec4<u32>>;
 
 // Must match WRITE_MARKER on the CPU side: windows are filled with it before their initial write
-let WRITE_MARKER: u32 = 0xA5C396E1u;
+const WRITE_MARKER: u32 = 0xA5C396E1u;
 
 fn addr_value_by_index(i:u32, calc_param:u32)->vec4<u32>
 {
@@ -58,8 +60,8 @@ fn test_value_by_index(i:u32)->vec4<u32>
 }
 
 
-let TEST_WINDOW_1D_MAX_GROUPS: u32 = 0x4000u;
-let TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY: u32 = 0x2000u;//don't inner-multiply by window size
+const TEST_WINDOW_1D_MAX_GROUPS: u32 = 0x4000u;
+const TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY: u32 = 0x2000u;//don't inner-multiply by window size
 
 @compute @workgroup_size(64, 1, 1)
 fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
@@ -91,7 +93,7 @@ fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
                 atomicAdd(&io.err_bit1_idx[bit_idx], 1u);
             }
             atomicAdd(&io.err_bitcount[one_bits % 32u], 1u);
-            let vec_addr: u32 = effective_addr * 4u + i;
+            let vec_addr: u32 = effective_addr * 4u + u32(i);
             atomicMax(&io.idx_max, vec_addr);
             atomicMin(&io.idx_min, vec_addr);
             atomicMax(&io.done_iter_or_err, 0xFFFFFFFFu); //ERROR_STATUS
