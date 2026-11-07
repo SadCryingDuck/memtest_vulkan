@@ -82,7 +82,13 @@ impl NamedComputeDevice {
         env: &ProcessEnv,
         log_dupler: &mut output::LogDupler<Writer>,
     ) -> i64 {
+        // integrated GPUs use system RAM as video memory: leave enough of it for the system
+        let system_memory = (self.physical_props.device_type
+            != vk::PhysicalDeviceType::DISCRETE_GPU)
+            .then(ram::system_memory)
+            .flatten();
         let mut max_budget = 0;
+        let mut limited_by_system_memory = false;
         for i in 0..self.memory_props.memory_heap_count as usize {
             if env.verbose() {
                 let _ = writeln!(
@@ -109,13 +115,29 @@ impl NamedComputeDevice {
             if budget > 0 {
                 heap_free = min(heap_free, budget);
             }
-            if self.physical_props.device_type != vk::PhysicalDeviceType::DISCRETE_GPU {
-                // for non-descrete GPUs consult the system free memory
-                if let Some(ram_budget) = ram::budget() {
-                    heap_free = min(heap_free, ram_budget as i64);
+            let mut limited_here = false;
+            if let Some(memory) = system_memory {
+                let usable = memory.usable_for_gpu() as i64;
+                if usable < heap_free {
+                    heap_free = usable;
+                    limited_here = true;
                 }
             }
-            max_budget = max(max_budget, heap_free - TEST_DATA_KEEP_FREE);
+            if heap_free - TEST_DATA_KEEP_FREE > max_budget {
+                max_budget = heap_free - TEST_DATA_KEEP_FREE;
+                limited_by_system_memory = limited_here;
+            }
+        }
+        if limited_by_system_memory && let Some(memory) = system_memory {
+            let _ = writeln!(
+                log_dupler,
+                "Integrated GPU: testing up to {:.1}GB of system RAM, leaving {:.1}GB for the system\n\
+                 ({:.1}GB of {:.1}GB available now). Use --size to change it.",
+                max(max_budget, 0) as f32 / GB,
+                memory.reserve_for_system() as f32 / GB,
+                memory.available as f32 / GB,
+                memory.total as f32 / GB,
+            );
         }
         max_budget
     }

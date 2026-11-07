@@ -198,6 +198,8 @@ The summary at the end of the test also gives the *likely cause* the error patte
 
 If the test warns that a test window reads many times slower than the others, the driver placed that part of the test memory in system RAM, usually because other programs use the VRAM. That part of the test then checks system RAM instead of VRAM: close other programs using the GPU or test less memory with `--size`.
 
+Integrated GPUs use system RAM as video memory, so by default they test only the system RAM that is available, minus a reserve for the system and other programs (20% of the total RAM, at least 2GB). The amount is shown when the test starts, and `--size` changes it.
+
 You can create [topic in discussions](https://github.com/GpuZelenograd/memtest_vulkan/discussions/new?category=card-specific-memtest_vulkan-error-logs), sometimes the error log can be interpreted. Bust most of the time it is quite complex task, expand the theory section below
 
 <details><summary>
@@ -251,7 +253,7 @@ Typical causes are software or hardware not supported by memtets_vulkan:
   * Pre-2016 GPU: Some older GPUs are not supported due to driver limitations, like GTX780Ti on Windows even with the latest 472.xx driver
   * Old OS/driver: Windows 7 with 47x.xx driver has driver limitations even with post-2016 GPUs that are supported in newer environments.
 * `Couldn't determine how much memory to test` on the integrated GPU <br>
-If the integrated GPU is configured with fixed & quite low dedicated memory size - it may be shown in memtest_vulkan output only with 1GB VRAM: `1GB AMD Radeon(TM) Vega 3 Graphics` and then fail. The vulkan implementation for integrated GPUs allows using a bit less memory than reserved, and memtest_vulkan requires at least 1GB available memory to operate. Reconfigure integrated GPU to reserve at least 1.5GB of memory, see [issue #22](https://github.com/GpuZelenograd/memtest_vulkan/issues/22)
+If the integrated GPU is configured with fixed & quite low dedicated memory size - it may be shown in memtest_vulkan output only with 1GB VRAM: `1GB AMD Radeon(TM) Vega 3 Graphics` and then fail. The vulkan implementation for integrated GPUs allows using a bit less memory than reserved, and memtest_vulkan requires at least 1GB available memory to operate. Reconfigure integrated GPU to reserve at least 1.5GB of memory, see [issue #22](https://github.com/GpuZelenograd/memtest_vulkan/issues/22). The same message shows when too little system RAM is free for an integrated GPU: close other programs, or set the amount with `--size`.
 * `the test couldn't run because of a runtime error` <br>
 If the test fails to start and shows this message for a newer GPU - there is some incompatibility in vulkan installation. This may be caused by outdated driver or conflicts between several vulkan drivers installed. <br> <br>
 For example on Linux the test can be run with a specific ICD the following way:<br>

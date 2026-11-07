@@ -346,8 +346,8 @@ fn select_device_and_test<Writer: std::io::Write>(
                 if estimate > 0 && size > estimate {
                     let _ = writeln!(
                         log_dupler,
-                        "WARNING: --size {:.1}GB is more than the free VRAM estimate of {:.1}GB. The driver may\n\
-                         swap test memory to system RAM, so part of the test wouldn't check VRAM.",
+                        "WARNING: --size {:.1}GB is more than the {:.1}GB of memory estimated to be free.\n\
+                         Part of the test memory may be swapped, so that part wouldn't check the GPU memory.",
                         size as f32 / GB,
                         estimate as f32 / GB
                     );
