@@ -1,13 +1,22 @@
-use mortal::Event;
-use mortal::terminal::Key;
+//! Console input (the GPU selection prompt, "press any key") and the result color.
 
-use std::io::Write;
+use crossterm::{
+    cursor::{MoveLeft, MoveToColumn},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    queue,
+    style::{Color, Print, ResetColor, SetForegroundColor},
+    terminal::{self, Clear, ClearType},
+};
+use std::io::{IsTerminal, Write};
 
+/// Reads keys from the console in raw mode; restores the console when dropped
 #[derive(Default)]
 pub struct Reader {
     pub current_input: String,
-    terminal: Option<mortal::Terminal>,
-    prepare_state: Option<mortal::terminal::PrepareState>,
+    /// raw mode was enabled by this reader
+    raw_mode: bool,
+    /// a color was set, so it's reset when dropped
+    colored: bool,
 }
 
 pub enum ReaderEvent {
@@ -27,60 +36,72 @@ impl Reader {
             //terminal input not available, treate it as empty input
             return Ok(ReaderEvent::Completed);
         }
-        let terminal = self.terminal.as_ref().unwrap();
-        terminal.move_to_first_column()?;
-        terminal.clear_to_line_end()?;
-        terminal.write_str(prompt)?;
-        terminal.write_str(&self.current_input)?;
-        match terminal.read_event(Some(*timeout))? {
-            Some(Event::Key(Key::Enter)) => Ok(ReaderEvent::Completed),
-            Some(Event::Key(Key::Ctrl('m'))) => Ok(ReaderEvent::Completed),
-            Some(Event::Key(Key::Ctrl('j'))) => Ok(ReaderEvent::Completed),
-
-            Some(Event::Key(Key::Escape)) => Ok(ReaderEvent::Canceled),
-            Some(Event::Key(Key::Ctrl('q'))) => Ok(ReaderEvent::Canceled),
-            Some(Event::Key(Key::Ctrl('c'))) => Ok(ReaderEvent::Canceled),
-            Some(Event::Key(Key::Ctrl('z'))) => Ok(ReaderEvent::Canceled),
-            Some(Event::Key(Key::Ctrl('x'))) => Ok(ReaderEvent::Canceled),
-            Some(Event::Key(Key::Ctrl('d'))) => Ok(ReaderEvent::Canceled),
-
-            Some(Event::Key(Key::Char(c))) => {
-                if c.is_ascii_control() {
-                    //unexpected control keys
-                    Ok(ReaderEvent::Canceled)
-                } else {
-                    if c.is_ascii_digit() {
-                        terminal.write_char(c)?;
-                        self.current_input.push(c);
-                    }
-                    Ok(ReaderEvent::Edited)
-                }
-            }
-            Some(Event::Key(Key::Backspace)) | Some(Event::Key(Key::Delete)) => {
-                self.handle_backspace()?;
-                Ok(ReaderEvent::Edited)
-            }
-
-            Some(Event::Key(_)) => Ok(ReaderEvent::Edited),
-            Some(Event::Signal(_)) => Ok(ReaderEvent::Canceled),
-            _ => Ok(ReaderEvent::Timeout),
+        let mut out = std::io::stdout();
+        queue!(
+            out,
+            MoveToColumn(0),
+            Clear(ClearType::UntilNewLine),
+            Print(prompt),
+            Print(&self.current_input)
+        )?;
+        out.flush()?;
+        if !event::poll(*timeout)? {
+            return Ok(ReaderEvent::Timeout);
         }
+        let Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind,
+            ..
+        }) = event::read()?
+        else {
+            return Ok(ReaderEvent::Timeout); // resize, focus and other events: just redraw
+        };
+        if kind == KeyEventKind::Release {
+            return Ok(ReaderEvent::Timeout); // keys are handled when pressed
+        }
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        let result = match code {
+            KeyCode::Enter => ReaderEvent::Completed,
+            KeyCode::Char('m' | 'j') if ctrl => ReaderEvent::Completed,
+            KeyCode::Esc => ReaderEvent::Canceled,
+            KeyCode::Char('q' | 'c' | 'z' | 'x' | 'd') if ctrl => ReaderEvent::Canceled,
+            KeyCode::Char(c) if c.is_ascii_control() => ReaderEvent::Canceled, //unexpected control keys
+            KeyCode::Char(c) => {
+                if c.is_ascii_digit() {
+                    queue!(out, Print(c))?;
+                    out.flush()?;
+                    self.current_input.push(c);
+                }
+                ReaderEvent::Edited
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                self.handle_backspace()?;
+                ReaderEvent::Edited
+            }
+            _ => ReaderEvent::Edited,
+        };
+        if matches!(result, ReaderEvent::Completed | ReaderEvent::Canceled) {
+            // back to normal console mode before the caller prints the outcome
+            self.restore_mode();
+        }
+        Ok(result)
     }
+
     pub fn set_pass_fail_accent_color(&mut self, failed: bool) {
         if crate::close::close_requested() {
             //color methods not available while closing on windows
             return;
         }
-        use mortal::terminal::Color;
-        if !self.try_prepare_terminal() {
-            //terminal input not available, don't perform wait.
-            return;
+        let mut out = std::io::stdout();
+        if !out.is_terminal() {
+            return; // no colors in redirected output
         }
-        let terminal = self.terminal.as_ref().unwrap();
-        let _ = terminal.set_fg(Some(match failed {
-            false => Color::Green,
-            true => Color::Red,
-        }));
+        let color = if failed { Color::Red } else { Color::Green };
+        if queue!(out, SetForegroundColor(color)).is_ok() {
+            self.colored = true;
+        }
+        let _ = out.flush();
     }
 
     pub fn wait_any_key(&mut self, immediate_close_on_signal_during_wait: bool) {
@@ -111,64 +132,54 @@ impl Reader {
         if immediate_close_on_signal_during_wait {
             crate::close::prefer_immediate_to_graceful();
         }
-        let terminal = self.terminal.as_ref().unwrap();
-        loop {
-            match terminal.read_event(Some(std::time::Duration::ZERO)) {
-                Ok(None) => break,
-                Err(_) => return,
-                _ => continue,
+        // ignore keys pressed before the question was shown
+        while matches!(event::poll(std::time::Duration::ZERO), Ok(true)) {
+            if event::read().is_err() {
+                return;
             }
         }
-        if terminal
-            .write_str("  press any key to continue...")
-            .is_err()
-        {
+        let mut out = std::io::stdout();
+        if write!(out, "  press any key to continue...").is_err() || out.flush().is_err() {
             return;
         }
         loop {
-            match terminal.read_event(None) {
-                Err(_) => return,
-                Ok(Some(Event::NoEvent)) | Ok(Some(Event::Resize(_))) => continue,
-                _user_event => break,
-            };
+            match event::read() {
+                Err(_) => break,
+                Ok(Event::Key(KeyEvent { kind, .. })) if kind != KeyEventKind::Release => break,
+                Ok(_) => continue, // key releases, resize and other events
+            }
         }
-        let _ignored = terminal.set_fg(None);
-        let _ignored = terminal.write_str("\n");
+        self.restore_mode();
+        let _ = queue!(out, ResetColor, Print("\n"));
+        self.colored = false;
+        let _ = out.flush();
     }
+
+    /// Enables raw mode to read single keys, if the console is interactive
     fn try_prepare_terminal(&mut self) -> bool {
-        if self.prepare_state.is_some() {
+        if self.raw_mode {
             return true;
         }
-        let tried_terminal = mortal::Terminal::new();
-        self.terminal = match tried_terminal {
-            Ok(terminal) => Some(terminal),
-            _ => return false,
-        };
-        let terminal = self.terminal.as_ref().unwrap();
-        let mut signals = mortal::signal::SignalSet::new();
-        signals.insert(mortal::signal::Signal::Break);
-        signals.insert(mortal::signal::Signal::Interrupt);
-        signals.insert(mortal::signal::Signal::Quit);
-        let tried_prepare = terminal.prepare(mortal::terminal::PrepareConfig {
-            block_signals: false,
-            enable_keypad: false,
-            report_signals: signals,
-            ..mortal::terminal::PrepareConfig::default()
-        });
-        match tried_prepare {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             //terminal input not available, treate it as empty input
-            Err(_) => return false,
-            Ok(state) => self.prepare_state = Some(state),
+            return false;
         }
-        true
+        self.raw_mode = terminal::enable_raw_mode().is_ok();
+        self.raw_mode
     }
+
+    fn restore_mode(&mut self) {
+        if self.raw_mode {
+            let _ = terminal::disable_raw_mode();
+            self.raw_mode = false;
+        }
+    }
+
     fn handle_backspace(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.current_input.is_empty() {
-            if let Some(terminal) = &mut self.terminal {
-                terminal.move_left(1)?;
-                terminal.clear_to_line_end()?;
-            }
-            self.current_input.pop();
+        if self.current_input.pop().is_some() {
+            let mut out = std::io::stdout();
+            queue!(out, MoveLeft(1), Clear(ClearType::UntilNewLine))?;
+            out.flush()?;
         }
         Ok(())
     }
@@ -179,11 +190,11 @@ impl Drop for Reader {
         if crate::close::close_requested() {
             return; //don't touch console methods while closing
         }
-        if let Some(terminal) = &mut self.terminal
-            && let Some(state) = self.prepare_state.take()
-        {
-            let _ = terminal.set_fg(None);
-            let _ = terminal.restore(state);
+        self.restore_mode();
+        if self.colored {
+            let mut out = std::io::stdout();
+            let _ = queue!(out, ResetColor);
+            let _ = out.flush();
         }
     }
 }
