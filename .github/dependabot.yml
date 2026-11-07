@@ -1,0 +1,19 @@
+# Weekly pull requests for new versions of the GitHub Actions and Rust crates this project uses.
+# Each ecosystem's updates come grouped in one pull request, so they arrive as one CI-checked change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      crates:
+        patterns: ['*']

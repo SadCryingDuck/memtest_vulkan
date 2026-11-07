@@ -1,9 +1,9 @@
 name: ci
 
-# Checks and builds every push and pull request; the release workflow reuses it for tags.
+# Checks and builds pushes to master and every pull request; the release workflow reuses it for tags.
 on:
   push:
-    branches: ['**']
+    branches: [master]
   pull_request:
   workflow_call:
     inputs:
