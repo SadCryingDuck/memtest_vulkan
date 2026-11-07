@@ -85,10 +85,57 @@ pub struct IOBuf {
     pub unwritten_count: u32,
     /// calc_param of the data held in this window before the last write
     pub prev_calc_param: u32,
-    /// nonzero if the window was rewritten since the previous pass, so prev_calc_param data is stale
-    pub check_stale: u32,
-    pub reserved: u32, // keeps first_elem 16-byte aligned like vec4 in WGSL
+    /// how the window's previous data (prev_calc_param) is checked: 0 - not checked
+    /// (the window wasn't rewritten), 1 - previous data as is, 2 - previous data inverted
+    pub stale_mode: u32,
+    /// the pattern is written and expected XORed with this: 0 as is, FFFFFFFF inverted
+    pub xor_mask: u32,
     pub first_elem: MostlyZeroArr<VEC_SIZE>,
+}
+
+/// The values a window is written with: the pattern for calc_param, as is or inverted
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pattern {
+    pub calc_param: u32,
+    pub inverted: bool,
+}
+
+impl Pattern {
+    /// The initial fill of every window, kept by window 0 for the whole test
+    pub fn initial() -> Self {
+        Self {
+            calc_param: IOBuf::calc_param_for(1, 0),
+            inverted: false,
+        }
+    }
+
+    /// Pattern written to window `window_idx` on iteration `iter` (from 1) of the main loop.
+    /// Iterations come in pairs writing the same pattern as is, then inverted, so every bit
+    /// of the memory holds both 0 and 1 and flips between them.
+    pub fn for_iteration(iter: u32, window_idx: i64) -> Self {
+        Self {
+            calc_param: IOBuf::calc_param_for(iter.div_ceil(2), window_idx),
+            inverted: iter.is_multiple_of(2),
+        }
+    }
+
+    pub fn xor_mask(self) -> u32 {
+        if self.inverted { u32::MAX } else { 0 }
+    }
+
+    /// Expected value of the u32 at `index` in the window, as computed by the shader
+    #[allow(clippy::manual_rotate)] // this is kept as similar to WGSL shader as possible
+    pub fn value(self, index: u32) -> u32 {
+        // wrapping like u32 arithmetic in the shader (avoids overflow panics in debug builds)
+        let addr = index.wrapping_add(self.calc_param).wrapping_add(1);
+        let shift = addr % 31u32;
+        let rotated = if shift > 0 {
+            addr << shift | addr >> (32 - shift)
+        } else {
+            addr
+        };
+        rotated ^ self.xor_mask()
+    }
 }
 
 // IOBuf must have the same layout as the WGSL struct: 3*32 + 12 u32 fields + vec4
@@ -164,6 +211,21 @@ impl IOBuf {
         iter.wrapping_mul(0x100107)
             .wrapping_add(window_idx as u32 * 0x81_u32)
     }
+    /// Sets the pattern the shader writes or expects
+    pub fn set_pattern(&mut self, pattern: Pattern) {
+        self.calc_param = pattern.calc_param;
+        self.xor_mask = pattern.xor_mask();
+    }
+    /// Sets what the window held before its last write, None if it wasn't rewritten
+    pub fn set_previous_pattern(&mut self, previous: Option<Pattern>) {
+        match previous {
+            None => self.stale_mode = 0,
+            Some(previous) => {
+                self.prev_calc_param = previous.calc_param;
+                self.stale_mode = if previous.inverted { 2 } else { 1 };
+            }
+        }
+    }
     /// Count of wrong 32-bit values found by the read pass
     pub fn wrong_words(&self) -> i64 {
         // wrong values reading as FFFFFFFF are counted only in actual_ff, not in mem_bitcount
@@ -198,7 +260,8 @@ impl IOBuf {
             iter: self.iter,
             calc_param: self.calc_param,
             prev_calc_param: self.prev_calc_param,
-            check_stale: self.check_stale,
+            stale_mode: self.stale_mode,
+            xor_mask: self.xor_mask,
             idx_max: u32::MIN,
             idx_min: u32::MAX,
             actual_max: u32::MIN,
@@ -222,21 +285,16 @@ impl IOBuf {
             ))
         }
     }
-    #[allow(clippy::manual_rotate)] // this is kept as similar to WGSL shader as possible
+    /// Checks the expected value the shader reported for vec4 1 against the CPU calculation
     pub fn check_vec_first(&self) -> Result<(), Box<dyn std::error::Error>> {
         const TEST_IDX: u32 = 1;
-        // wrapping like u32 arithmetic in the shader (avoids overflow panics in debug builds)
-        let addr: u32 = self
-            .calc_param
-            .wrapping_add(TEST_IDX * VEC_SIZE as u32 + 1u32);
-        let shift = addr % 31u32;
-        let rotated = if shift > 0 {
-            addr << shift | addr >> (32 - shift)
-        } else {
-            addr
+        let pattern = Pattern {
+            calc_param: self.calc_param,
+            inverted: self.xor_mask != 0,
         };
-        if rotated != self.first_elem.0[0] {
-            println!("{} 0x{:08X}", self, rotated);
+        let expected = pattern.value(TEST_IDX * VEC_SIZE as u32);
+        if expected != self.first_elem.0[0] {
+            println!("{} 0x{:08X}", self, expected);
             return Err("unexpected calculated value, maybe shader execution is broken".into());
         }
         Ok(())
@@ -417,6 +475,51 @@ mod tests {
             IOBuf::calc_param_for(u32::MAX, 2),
             u32::MAX.wrapping_mul(0x100107).wrapping_add(2 * 0x81)
         );
+    }
+
+    #[test]
+    fn iterations_pair_a_pattern_with_its_inverse() {
+        let plain = Pattern::for_iteration(5, 2);
+        let inverted = Pattern::for_iteration(6, 2);
+        assert!(!plain.inverted && inverted.inverted);
+        assert_eq!(plain.calc_param, inverted.calc_param);
+        for index in [0, 1, 4, 1000, 0xFFFF_FFF0] {
+            // every bit holds both 0 and 1 over the pair
+            assert_eq!(inverted.value(index), !plain.value(index));
+        }
+        // the next pair writes different values
+        assert_ne!(Pattern::for_iteration(7, 2).value(4), plain.value(4));
+        // iteration 1 differs from the initial fill in every window but 0, so missing writes show
+        assert_eq!(Pattern::for_iteration(1, 0), Pattern::initial());
+        assert_ne!(
+            Pattern::for_iteration(1, 1).value(4),
+            Pattern::initial().value(4)
+        );
+    }
+
+    #[test]
+    fn shader_value_check_accounts_for_inversion() {
+        for iteration in [1, 2] {
+            let pattern = Pattern::for_iteration(iteration, 1);
+            let mut buf = IOBuf::for_initial_iteration();
+            buf.set_pattern(pattern);
+            buf.first_elem.0[0] = pattern.value(4);
+            assert!(buf.check_vec_first().is_ok());
+            buf.first_elem.0[0] = !pattern.value(4);
+            assert!(buf.check_vec_first().is_err());
+        }
+    }
+
+    #[test]
+    fn previous_pattern_sets_stale_mode() {
+        let mut buf = IOBuf::for_initial_iteration();
+        buf.set_previous_pattern(None);
+        assert_eq!(buf.stale_mode, 0);
+        buf.set_previous_pattern(Some(Pattern::for_iteration(3, 1)));
+        assert_eq!(buf.stale_mode, 1);
+        buf.set_previous_pattern(Some(Pattern::for_iteration(4, 1)));
+        assert_eq!(buf.stale_mode, 2);
+        assert_eq!(buf.prev_calc_param, Pattern::for_iteration(4, 1).calc_param);
     }
 
     fn totals_of(buf: &IOBuf) -> ErrorTotals {

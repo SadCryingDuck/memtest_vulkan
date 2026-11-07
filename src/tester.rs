@@ -6,7 +6,7 @@ use crate::{
     close,
     devices::NamedComputeDevice,
     display_this_process_result,
-    iobuf::{ErrorTotals, IOBuf},
+    iobuf::{ErrorTotals, IOBuf, Pattern},
     output, ram,
     shader::{
         ALLOCATION_TRY_STEP, ELEMENT_SIZE, EMULATE_SKIPPED_WRITE_ENV, GB,
@@ -425,16 +425,16 @@ impl<'a> Tester<'a> {
         Ok(start.elapsed())
     }
 
-    /// Writes the test pattern for `calc_param` to a window
+    /// Writes a test pattern to a window
     fn write_window(
         &self,
         window_idx: usize,
-        calc_param: u32,
+        pattern: Pattern,
         fill_marker: bool,
         pipeline: Option<vk::Pipeline>,
     ) -> BoxResult<Duration> {
         let mut io = IOBuf::for_initial_iteration();
-        io.calc_param = calc_param;
+        io.set_pattern(pattern);
         self.io_write(io);
         self.run_pass(window_idx, fill_marker, pipeline)
     }
@@ -902,13 +902,14 @@ fn initial_fill<Writer: std::io::Write>(
     last_error_at: &mut Option<Duration>,
     skip_last_write: bool,
 ) -> BoxResult<()> {
-    let initial = IOBuf::for_initial_iteration();
+    let mut initial = IOBuf::for_initial_iteration();
+    initial.set_pattern(Pattern::initial());
     let window_count = tester.windows.len();
     for window_idx in 0..window_count {
         let skip_write = skip_last_write && window_idx == window_count - 1;
         tester.write_window(
             window_idx,
-            initial.calc_param,
+            Pattern::initial(),
             true,
             (!skip_write).then_some(tester.pipelines.write),
         )?;
@@ -1018,7 +1019,7 @@ fn main_loop<Writer: std::io::Write>(
             };
             period.write_time += tester.write_window(
                 window_idx,
-                IOBuf::calc_param_for(buffer_in.iter, window_idx as i64),
+                Pattern::for_iteration(buffer_in.iter, window_idx as i64),
                 false,
                 write_pipeline,
             )?;
@@ -1054,19 +1055,20 @@ fn main_loop<Writer: std::io::Write>(
             for window_idx in 0..window_count {
                 let io_in = if window_idx == 0 {
                     // window 0 is never rewritten: check the data of the initial fill
-                    IOBuf::for_initial_iteration()
+                    let mut io = IOBuf::for_initial_iteration();
+                    io.set_pattern(Pattern::initial());
+                    io
                 } else {
                     let mut io = buffer_in;
-                    io.calc_param = IOBuf::calc_param_for(buffer_in.iter, window_idx as i64);
+                    io.set_pattern(Pattern::for_iteration(buffer_in.iter, window_idx as i64));
                     // The data this window held before this iteration's write: the initial fill
-                    // (iteration 1 parameters, no window offset) or the previous iteration's write.
+                    // or the previous iteration's write.
                     // Reading it back means this iteration's write never reached memory.
-                    io.prev_calc_param = if iteration == 1 {
-                        IOBuf::calc_param_for(1, 0)
+                    io.set_previous_pattern(Some(if iteration == 1 {
+                        Pattern::initial()
                     } else {
-                        IOBuf::calc_param_for(buffer_in.iter.wrapping_sub(1), window_idx as i64)
-                    };
-                    io.check_stale = 1;
+                        Pattern::for_iteration(buffer_in.iter.wrapping_sub(1), window_idx as i64)
+                    }));
                     io
                 };
                 let (io_out, read_time) = tester.read_window(window_idx, io_in)?;

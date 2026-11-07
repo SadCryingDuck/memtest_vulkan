@@ -18,8 +18,8 @@ struct IOBuf
     calc_param: u32,
     unwritten_count: u32,
     prev_calc_param: u32,
-    check_stale: u32,
-    reserved: u32,
+    stale_mode: u32,
+    xor_mask: u32,
     first_elem: vec4<u32>
 }
 
@@ -45,9 +45,16 @@ fn test_value_for_param(i:u32, calc_param:u32)->vec4<u32>
     return rotated;
 }
 
+fn splat(value:u32)->vec4<u32>
+{
+    return vec4<u32>(value, value, value, value);
+}
+
+// The pattern is written either as is (xor_mask 0) or bitwise inverted (xor_mask FFFFFFFF),
+// so every bit of the memory holds both 0 and 1 over two iterations
 fn test_value_by_index(i:u32)->vec4<u32>
 {
-    return test_value_for_param(i, io.calc_param);
+    return test_value_for_param(i, io.calc_param) ^ splat(io.xor_mask);
 }
 
 
@@ -65,14 +72,16 @@ fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     if any(actual_value != expected_value) {
         //slow path, executed only on errors found
         // what this memory held before the last write: lets us tell "write never landed" from corruption
-        let stale_value : vec4<u32> = test_value_for_param(effective_addr, io.prev_calc_param);
+        // stale_mode: 0 - don't check, 1 - previous data as is, 2 - previous data inverted
+        let stale_mask : u32 = select(0u, 0xFFFFFFFFu, io.stale_mode == 2u);
+        let stale_value : vec4<u32> = test_value_for_param(effective_addr, io.prev_calc_param) ^ splat(stale_mask);
         for(var i: i32 = 0; i < 4; i++) {
             let actual_u32 = actual_value[i];
             let error_mask = actual_u32 ^ expected_value[i];
             if error_mask == 0 {
                 continue;
             }
-            if actual_u32 == WRITE_MARKER || (io.check_stale != 0u && actual_u32 == stale_value[i]) {
+            if actual_u32 == WRITE_MARKER || (io.stale_mode != 0u && actual_u32 == stale_value[i]) {
                 atomicAdd(&io.unwritten_count, 1u);
             }
             let one_bits = countOneBits(error_mask);
