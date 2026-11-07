@@ -1,93 +1,23 @@
-//! Console input (the GPU selection prompt, "press any key") and the result color.
+//! "Press any key" at the end and the result color. The start screen is in start_screen.rs.
 
 use crossterm::{
-    cursor::{MoveLeft, MoveToColumn},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyEvent, KeyEventKind},
     queue,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{self, Clear, ClearType},
+    terminal,
 };
 use std::io::{IsTerminal, Write};
 
 /// Reads keys from the console in raw mode; restores the console when dropped
 #[derive(Default)]
 pub struct Reader {
-    pub current_input: String,
     /// raw mode was enabled by this reader
     raw_mode: bool,
     /// a color was set, so it's reset when dropped
     colored: bool,
 }
 
-pub enum ReaderEvent {
-    Timeout,
-    Edited,
-    Completed,
-    Canceled,
-}
-
 impl Reader {
-    pub fn input_digit_step(
-        &mut self,
-        prompt: &str,
-        timeout: &std::time::Duration,
-    ) -> Result<ReaderEvent, Box<dyn std::error::Error>> {
-        if !self.try_prepare_terminal() {
-            //terminal input not available, treate it as empty input
-            return Ok(ReaderEvent::Completed);
-        }
-        let mut out = std::io::stdout();
-        queue!(
-            out,
-            MoveToColumn(0),
-            Clear(ClearType::UntilNewLine),
-            Print(prompt),
-            Print(&self.current_input)
-        )?;
-        out.flush()?;
-        if !event::poll(*timeout)? {
-            return Ok(ReaderEvent::Timeout);
-        }
-        let Event::Key(KeyEvent {
-            code,
-            modifiers,
-            kind,
-            ..
-        }) = event::read()?
-        else {
-            return Ok(ReaderEvent::Timeout); // resize, focus and other events: just redraw
-        };
-        if kind == KeyEventKind::Release {
-            return Ok(ReaderEvent::Timeout); // keys are handled when pressed
-        }
-        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-        let result = match code {
-            KeyCode::Enter => ReaderEvent::Completed,
-            KeyCode::Char('m' | 'j') if ctrl => ReaderEvent::Completed,
-            KeyCode::Esc => ReaderEvent::Canceled,
-            KeyCode::Char('q' | 'c' | 'z' | 'x' | 'd') if ctrl => ReaderEvent::Canceled,
-            KeyCode::Char(c) if c.is_ascii_control() => ReaderEvent::Canceled, //unexpected control keys
-            KeyCode::Char(c) => {
-                if c.is_ascii_digit() {
-                    queue!(out, Print(c))?;
-                    out.flush()?;
-                    self.current_input.push(c);
-                }
-                ReaderEvent::Edited
-            }
-            KeyCode::Backspace | KeyCode::Delete => {
-                self.handle_backspace()?;
-                ReaderEvent::Edited
-            }
-            _ => ReaderEvent::Edited,
-        };
-        if matches!(result, ReaderEvent::Completed | ReaderEvent::Canceled) {
-            // back to normal console mode before the caller prints the outcome
-            self.restore_mode();
-        }
-        Ok(result)
-    }
-
     pub fn set_pass_fail_accent_color(&mut self, failed: bool) {
         if crate::close::close_requested() {
             //color methods not available while closing on windows
@@ -173,15 +103,6 @@ impl Reader {
             let _ = terminal::disable_raw_mode();
             self.raw_mode = false;
         }
-    }
-
-    fn handle_backspace(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.current_input.pop().is_some() {
-            let mut out = std::io::stdout();
-            queue!(out, MoveLeft(1), Clear(ClearType::UntilNewLine))?;
-            out.flush()?;
-        }
-        Ok(())
     }
 }
 

@@ -14,6 +14,7 @@ mod iobuf;
 mod output;
 mod ram;
 mod shader;
+mod start_screen;
 mod tester;
 mod vk_util;
 
@@ -94,75 +95,6 @@ impl ProcessEnv {
     fn wait_for_key(&self) -> bool {
         self.interactive && !self.options.batch
     }
-}
-
-fn prompt_for_label(verbose: bool) -> Option<isize> {
-    let mut device_test_index = Some(0isize);
-    let prompt_start = time::Instant::now();
-    let mut prompt_duration: Option<time::Duration> = Some(time::Duration::from_secs(10));
-
-    let mut input_reader = input::Reader::default();
-    let no_timer_prompt = String::from(
-        "                                             Enter the number of the GPU to test:",
-    );
-    loop {
-        let mut prompt = &no_timer_prompt;
-        let formatted_prompt: String;
-        if let Some(effective_duration) = prompt_duration {
-            if effective_duration < prompt_start.elapsed() {
-                println!();
-                println!("    ...testing GPU 1");
-                break;
-            } else {
-                let duration_left = effective_duration - prompt_start.elapsed();
-                formatted_prompt = std::format!(
-                    "(GPU 1 will be tested in {} seconds)   Enter the number of the GPU to test:",
-                    duration_left.as_secs()
-                );
-                prompt = &formatted_prompt;
-            }
-        }
-        match input_reader.input_digit_step(prompt, &time::Duration::from_millis(250)) {
-            Ok(input::ReaderEvent::Edited) => prompt_duration = None,
-            Ok(input::ReaderEvent::Canceled) => {
-                println!();
-                device_test_index = None;
-                break;
-            }
-            Ok(input::ReaderEvent::Completed) => {
-                match input_reader.current_input.len()
-                    == input_reader.current_input.matches('0').count()
-                {
-                    true => {
-                        //empty or all zeroes
-                        println!();
-                        println!("    ...testing GPU 1");
-                    }
-                    false => match input_reader.current_input.parse::<isize>() {
-                        Ok(parsed_idx) => {
-                            device_test_index = Some(parsed_idx);
-                            println!();
-                        }
-                        Err(_) => {
-                            input_reader.current_input.clear();
-                            continue;
-                        }
-                    },
-                }
-                break;
-            }
-            Ok(input::ReaderEvent::Timeout) => {} //just redraw prompt
-            Err(e) => {
-                //if input machinery doesnt work treat it as nothing was enetred
-                if verbose {
-                    println!("Input machinery failure: {e}");
-                }
-                break;
-            }
-        }
-    }
-    drop(input_reader);
-    device_test_index
 }
 
 /// Starts the worker process testing `device`. Returns its exit code, or None if it couldn't start
@@ -295,10 +227,51 @@ fn test_selected_device<Writer: std::io::Write>(
     tester::prepare_and_test_device(loaded_devices.instance(), single_dev, env, log_dupler);
 }
 
+/// Shows the start screen, where the user can choose the GPU and change the settings
+/// before the test starts; doing nothing starts the default test after a countdown
+fn choose_settings<Writer: std::io::Write>(
+    loaded_devices: &LoadedDevices,
+    env: &mut ProcessEnv,
+    log_dupler: &mut output::LogDupler<Writer>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let choices: Vec<start_screen::DeviceChoice> = loaded_devices
+        .devices
+        .iter()
+        .map(|device| start_screen::DeviceChoice {
+            label: device.label.clone(),
+            testable: device.testable_memory().0,
+        })
+        .collect();
+    let defaults = start_screen::Settings {
+        device: 0,
+        duration: env.options.duration,
+        size: env.options.size,
+        stop_on_error: env.options.stop_on_error,
+    };
+    // more time to read the list and pick when there are several GPUs
+    let countdown = time::Duration::from_secs(if choices.len() > 1 { 10 } else { 5 });
+    let _ = log_dupler.flush();
+    match start_screen::show(&choices, defaults, countdown) {
+        start_screen::Outcome::Quit => {
+            // a deliberate choice, not an error: no "press any key"
+            let _ = writeln!(log_dupler, "Test cancelled, nothing was tested.");
+            let _ = log_dupler.flush();
+            close::exit_process(exit_code::INCOMPLETE)
+        }
+        start_screen::Outcome::Start(settings) => {
+            env.device_label.store(settings.device as isize + 1, SeqCst);
+            env.options.duration = settings.duration;
+            env.options.size = settings.size;
+            env.options.stop_on_error = settings.stop_on_error;
+            Ok(())
+        }
+    }
+}
+
 /// Shows the devices, selects one and tests it
 fn select_device_and_test<Writer: std::io::Write>(
     mut loaded_devices: LoadedDevices,
-    env: &ProcessEnv,
+    env: &mut ProcessEnv,
     log_dupler: &mut output::LogDupler<Writer>,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     if env.interactive {
@@ -313,16 +286,16 @@ fn select_device_and_test<Writer: std::io::Write>(
             let _ = log_dupler.flush();
             close::exit_process(exit_code::PASSED);
         }
-        if loaded_devices.devices.len() > 1 && env.options.device.is_none() {
+        if env.options.device.is_none() {
             if env.options.batch {
-                let _ = writeln!(
-                    log_dupler,
-                    "Testing GPU 1, use --device to choose another one"
-                );
-            } else if let Some(selected_label) = prompt_for_label(env.verbose()) {
-                env.device_label.store(selected_label, SeqCst);
+                if loaded_devices.devices.len() > 1 {
+                    let _ = writeln!(
+                        log_dupler,
+                        "Testing GPU 1, use --device to choose another one"
+                    );
+                }
             } else {
-                return Err("Test cancelled, no GPU selected".into());
+                choose_settings(&loaded_devices, env, log_dupler)?;
             }
         }
         close::setup_handler(close::HandlerMode::Graceful); //for interactive environments setup handler only after input prompt was run
@@ -568,7 +541,7 @@ fn display_result<Writer: std::io::Write>(
 }
 
 fn main() {
-    let env = init_running_env();
+    let mut env = init_running_env();
     if !env.interactive {
         // first Ctrl+C finishes the current pass and prints the summary, the second one quits at once
         close::setup_handler(close::HandlerMode::GracefulThenImmediate);
@@ -594,7 +567,8 @@ fn main() {
     {
         let _ = writeln!(log_dupler, "Log file: {}", log_path.display());
     }
-    let result = devices::list_devices_ordered_labeled_from_1(&env, &mut log_dupler)
-        .and_then(|loaded_devices| select_device_and_test(loaded_devices, &env, &mut log_dupler));
+    let result = devices::list_devices_ordered_labeled_from_1(&env, &mut log_dupler).and_then(
+        |loaded_devices| select_device_and_test(loaded_devices, &mut env, &mut log_dupler),
+    );
     display_result(result, &env, &mut log_dupler);
 }

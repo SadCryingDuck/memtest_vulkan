@@ -69,8 +69,9 @@ pub const HELP: &str = "\
 Usage: memtest_vulkan [OPTIONS]
 
 Tests GPU video memory (VRAM) for errors using Vulkan compute shaders.
-Without options it lists the GPUs, lets you pick one (the first one is picked
-after 10 seconds), runs the standard 5-minute test and waits for a key press.
+Without options it lists the GPUs and starts the standard 5-minute test after a
+short countdown. Before that you can type a GPU number, or press S for settings:
+the GPU, the duration, the memory size and stopping at the first error.
 
 Options:
   -d, --device <N>       Test GPU number N as shown in the list (no prompt)
@@ -96,7 +97,7 @@ Exit codes:
   1  memory errors found
   2  results invalid: test writes didn't reach the memory (likely a driver problem)
   3  the test couldn't run, or stopped because of a runtime error
-  4  stopped before the test duration ended, no errors so far
+  4  stopped before the test duration ended (or cancelled), no errors so far
 ";
 
 /// Parses a memory size like `4G`, `512MB`, `1.5GiB` or plain bytes

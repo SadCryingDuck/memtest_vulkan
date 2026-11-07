@@ -75,13 +75,10 @@ impl NamedComputeDevice {
         }
     }
 
-    /// Estimates how much memory can be tested: the free part of the biggest device-local heap,
-    /// minus a reserve for the system and other programs
-    pub fn estimate_testable_memory<Writer: std::io::Write>(
-        &self,
-        env: &ProcessEnv,
-        log_dupler: &mut output::LogDupler<Writer>,
-    ) -> i64 {
+    /// How much memory can be tested: the free part of the biggest device-local heap, minus a
+    /// reserve for the system and other programs. Also returns the system memory if free system
+    /// RAM is what limited it (integrated GPUs use system RAM as video memory).
+    pub fn testable_memory(&self) -> (i64, Option<ram::SystemMemory>) {
         // integrated GPUs use system RAM as video memory: leave enough of it for the system
         let system_memory = (self.physical_props.device_type
             != vk::PhysicalDeviceType::DISCRETE_GPU)
@@ -90,16 +87,6 @@ impl NamedComputeDevice {
         let mut max_budget = 0;
         let mut limited_by_system_memory = false;
         for i in 0..self.memory_props.memory_heap_count as usize {
-            if env.verbose() {
-                let _ = writeln!(
-                    log_dupler,
-                    "heap size {:4.1}GB budget {:4.1}GB usage {:4.1}GB flags={:#?}",
-                    self.memory_props.memory_heaps[i].size as f32 / GB,
-                    self.budget_props.heap_budget[i] as f32 / GB,
-                    self.budget_props.heap_usage[i] as f32 / GB,
-                    self.memory_props.memory_heaps[i].flags,
-                );
-            }
             if !self.memory_props.memory_heaps[i]
                 .flags
                 .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
@@ -128,10 +115,34 @@ impl NamedComputeDevice {
                 limited_by_system_memory = limited_here;
             }
         }
+        (
+            max_budget,
+            system_memory.filter(|_| limited_by_system_memory),
+        )
+    }
+
+    /// `testable_memory`, logging how it was found
+    pub fn estimate_testable_memory<Writer: std::io::Write>(
+        &self,
+        env: &ProcessEnv,
+        log_dupler: &mut output::LogDupler<Writer>,
+    ) -> i64 {
+        if env.verbose() {
+            for i in 0..self.memory_props.memory_heap_count as usize {
+                let _ = writeln!(
+                    log_dupler,
+                    "heap size {:4.1}GB budget {:4.1}GB usage {:4.1}GB flags={:#?}",
+                    self.memory_props.memory_heaps[i].size as f32 / GB,
+                    self.budget_props.heap_budget[i] as f32 / GB,
+                    self.budget_props.heap_usage[i] as f32 / GB,
+                    self.memory_props.memory_heaps[i].flags,
+                );
+            }
+        }
+        let (max_budget, limited_by) = self.testable_memory();
         // explain the limit, unless the user chose the size anyway
-        if limited_by_system_memory
+        if let Some(memory) = limited_by
             && env.options.size.is_none()
-            && let Some(memory) = system_memory
         {
             let _ = writeln!(
                 log_dupler,
