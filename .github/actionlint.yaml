@@ -1,0 +1,4 @@
+# GitHub-hosted runner labels newer than actionlint's built-in list (v1.7.12)
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

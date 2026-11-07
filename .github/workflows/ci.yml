@@ -26,7 +26,7 @@ env:
 jobs:
   lint:
     name: lint and test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
@@ -46,11 +46,11 @@ jobs:
             target: x86_64-pc-windows-msvc
           # Linux builds link against glibc 2.17 with zig, so they run on distributions back to 2014
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
             zig-target: x86_64-unknown-linux-gnu.2.17
           - name: linux-aarch64
-            os: ubuntu-latest
+            os: ubuntu-26.04
             target: aarch64-unknown-linux-gnu
             zig-target: aarch64-unknown-linux-gnu.2.17
     steps:
@@ -59,10 +59,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # zig from PyPI, which cargo-zigbuild runs through the given Python
       - if: matrix.zig-target
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
+        name: Install zig
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install --quiet ziglang==0.14.1
+          echo "CARGO_ZIGBUILD_PYTHON_PATH=$RUNNER_TEMP/zig/bin/python3" >> "$GITHUB_ENV"
       - if: matrix.zig-target
         uses: taiki-e/install-action@v2
         with:

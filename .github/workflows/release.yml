@@ -11,7 +11,7 @@ permissions:
 jobs:
   check-tag:
     name: check tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - name: Tag must match the Cargo.toml version and end with -duck
@@ -37,7 +37,7 @@ jobs:
 
   publish:
     needs: ci
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
