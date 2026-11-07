@@ -27,7 +27,7 @@ Alternatively, the tool can be started from cmdline
 </summary>
 <pre>
 C:\gpu-tools\memory>memtest_vulkan.exe --device 1 --size 6G
-memtest_vulkan v0.10.0-duck  https://github.com/SadCryingDuck/memtest_vulkan
+memtest_vulkan v0.12.0-duck  https://github.com/SadCryingDuck/memtest_vulkan
 Based on memtest_vulkan by GpuZelenograd. Press Ctrl+C to stop testing early, see --help for options.
 Log file: C:\gpu-tools\memory\memtest_vulkan.log
 
