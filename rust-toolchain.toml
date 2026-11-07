@@ -1,0 +1,5 @@
+# Latest stable Rust with the tools CI uses; rustup installs it automatically
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

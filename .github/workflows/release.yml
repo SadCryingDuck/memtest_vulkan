@@ -1,0 +1,59 @@
+name: release
+
+# Pushing a tag like v0.10.0-duck checks, builds and publishes a GitHub release.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  check-tag:
+    name: check tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag must match the Cargo.toml version and end with -duck
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "memtest_vulkan") | .version')
+          echo "Cargo.toml version: $version, tag: $GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match the version: tag it v$version"
+            exit 1
+          fi
+          case "$version" in
+            *-duck) ;;
+            *) echo "::error::Version $version must end with -duck"; exit 1 ;;
+          esac
+
+  ci:
+    needs: check-tag
+    uses: ./.github/workflows/ci.yml
+    with:
+      version-label: ${{ github.ref_name }}
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * | tee SHA256SUMS.txt
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "memtest_vulkan $GITHUB_REF_NAME" \
+            --generate-notes

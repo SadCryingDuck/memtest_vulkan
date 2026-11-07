@@ -1,39 +1,97 @@
 name: ci
+
+# Checks and builds every push and pull request; the release workflow reuses it for tags.
 on:
   push:
-    branches:
-      - '**'
-    tags:
-      - '**'
+    branches: ['**']
   pull_request:
-    branches: [ main ]
+  workflow_call:
+    inputs:
+      version-label:
+        description: Version part of the file names, like v0.10.0-duck
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-in-docker-job:
-    runs-on: ubuntu-24.04
+  lint:
+    name: lint and test
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all --all-targets --locked -- -D warnings
+      - run: cargo test --all --locked
+
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # Linux builds link against glibc 2.17 with zig, so they run on distributions back to 2014
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            zig-target: x86_64-unknown-linux-gnu.2.17
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            zig-target: aarch64-unknown-linux-gnu.2.17
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
         with:
-          key: '${{ github.ref_name }}-cargo'
-          path: |
-            target/
-            !target/artifacts/
-            /cargo/registry/cache/
-            /cargo/registry/src/
-      - uses: docker://ghcr.io/galkinvv/manycross2014:rust-1.91.0
+          key: ${{ matrix.target }}
+      - if: matrix.zig-target
+        uses: mlugg/setup-zig@v2
         with:
-          entrypoint: ./run-build.sh
-      - uses: actions/upload-artifact@v4
-        if: always()
+          version: 0.14.1
+      - if: matrix.zig-target
+        uses: taiki-e/install-action@v2
         with:
-          name: Windows .exe
-          path: target/artifacts/*.exe
-      - uses: actions/upload-artifact@v4
-        if: always()
+          tool: cargo-zigbuild
+      - name: Build
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.zig-target }}" ]; then
+            cargo zigbuild --release --locked --target "${{ matrix.zig-target }}"
+          else
+            cargo build --release --locked --target "${{ matrix.target }}"
+          fi
+      - name: Package
+        shell: bash
+        env:
+          VERSION_LABEL: ${{ inputs.version-label }}
+        run: |
+          label="${VERSION_LABEL:-git-$(git rev-parse --short HEAD)}"
+          name="memtest_vulkan-${label}-${{ matrix.name }}"
+          dir="target/${{ matrix.target }}/release"
+          mkdir -p dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "$dir/memtest_vulkan.exe" "dist/$name.exe"
+          else
+            tar -cJf "dist/$name.tar.xz" -C "$dir" memtest_vulkan
+          fi
+          ls -l dist
+      - uses: actions/upload-artifact@v7
         with:
-          name: Linux binaries (x86_64 and aarch64)
-          path: target/artifacts/*Linux*
-      - uses: docker://ghcr.io/galkinvv/manycross2014:rust-1.91.0
-        if: always()
-        with:
-          entrypoint: ./run-lint.sh
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
