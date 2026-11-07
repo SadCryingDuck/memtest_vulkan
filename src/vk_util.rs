@@ -66,10 +66,13 @@ pub trait MapErrRetryWithLowerMemory {
 fn describe<T>(result: vk::Result, context: Option<&str>) -> String {
     // the code name (like ERROR_INCOMPATIBLE_DRIVER) is what users search for and the
     // README's troubleshooting refers to; the description explains it
-    let mut message = format!(
-        "{result:?} ({result}) while getting {}",
-        std::any::type_name::<T>()
-    );
+    let mut message = format!("{result:?} ({result})");
+    // calls that return nothing, like allocate_memory's emulated limit, have no type to name
+    let type_name = std::any::type_name::<T>();
+    if type_name != "()" {
+        message += " while getting ";
+        message += type_name;
+    }
     if let Some(context) = context {
         message += " in context ";
         message += context;
@@ -130,4 +133,34 @@ pub unsafe extern "system" fn debug_callback(
 
     eprintln!("{}", cstr_message.to_string_lossy());
     vk::FALSE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describe_names_the_code_and_type() {
+        assert_eq!(
+            describe::<vk::Buffer>(
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+                Some("create_buffer")
+            ),
+            "ERROR_OUT_OF_DEVICE_MEMORY (A device memory allocation has failed) \
+             while getting ash::vk::definitions::Buffer in context create_buffer"
+        );
+    }
+
+    #[test]
+    fn describe_skips_the_type_for_calls_returning_nothing() {
+        let lost = vk::Result::ERROR_DEVICE_LOST;
+        assert_eq!(
+            describe::<()>(lost, Some("wait_for_fences")),
+            format!("ERROR_DEVICE_LOST ({lost}) in context wait_for_fences")
+        );
+        assert_eq!(
+            describe::<()>(lost, None),
+            format!("ERROR_DEVICE_LOST ({lost})")
+        );
+    }
 }
