@@ -12,6 +12,7 @@ mod input;
 mod iobuf;
 mod output;
 mod ram;
+mod schedule;
 mod shader;
 mod start_screen;
 mod tester;
@@ -114,7 +115,9 @@ fn run_worker<Writer: std::io::Write>(
         .arg("--size")
         .arg(env.max_test_bytes().to_string())
         .arg("--duration")
-        .arg(options.duration.to_arg());
+        .arg(options.duration.to_arg())
+        .arg("--test")
+        .arg(options.mode.arg());
     if let Some(window_mb) = options.window_mb {
         command.arg("--window-mb").arg(window_mb.to_string());
     }
@@ -252,6 +255,7 @@ fn choose_settings<Writer: std::io::Write>(
         .collect();
     let defaults = start_screen::Settings {
         device: 0,
+        mode: env.options.mode,
         duration: env.options.duration,
         size: env.options.size,
         stop_on_error: env.options.stop_on_error,
@@ -268,6 +272,7 @@ fn choose_settings<Writer: std::io::Write>(
         }
         start_screen::Outcome::Start(settings) => {
             env.device_label.store(settings.device as isize + 1, SeqCst);
+            env.options.mode = settings.mode;
             env.options.duration = settings.duration;
             env.options.size = settings.size;
             env.options.stop_on_error = settings.stop_on_error;

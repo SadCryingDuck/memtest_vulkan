@@ -22,6 +22,10 @@ struct IOBuf
     prev_calc_param: u32,
     stale_mode: u32,
     xor_mask: u32,
+    kind: u32,
+    prev_kind: u32,
+    order: u32,
+    reserved: u32,
     first_elem: vec4<u32>
 }
 
@@ -31,13 +35,21 @@ struct IOBuf
 // Must match WRITE_MARKER on the CPU side: windows are filled with it before their initial write
 const WRITE_MARKER: u32 = 0xA5C396E1u;
 
+// Pattern kinds, must match PatternKind on the CPU side
+const KIND_ADDRESS: u32 = 0u;     // derived from the address, so every value differs
+const KIND_WORD_TOGGLE: u32 = 1u; // 00000000 and FFFFFFFF, alternating word by word
+const KIND_CHECKERBOARD: u32 = 2u; // 55555555 and AAAAAAAA, alternating word by word
+
+// Access orders, must match AccessOrder on the CPU side
+const ORDER_RANDOM: u32 = 1u;
+
 fn addr_value_by_index(i:u32, calc_param:u32)->vec4<u32>
 {
     let effective_index_of_u32 = i * 4u + calc_param;
     return vec4<u32>(effective_index_of_u32 + 1u, effective_index_of_u32 + 2u, effective_index_of_u32 + 3u, effective_index_of_u32 + 4u);
 }
 
-fn test_value_for_param(i:u32, calc_param:u32)->vec4<u32>
+fn address_value(i:u32, calc_param:u32)->vec4<u32>
 {
     let addrs : vec4<u32> = addr_value_by_index(i, calc_param);
     let shifts : vec4<u32> = addrs % 31u;
@@ -52,23 +64,75 @@ fn splat(value:u32)->vec4<u32>
     return vec4<u32>(value, value, value, value);
 }
 
+// The values of vec4 i for a pattern kind, before the inversion
+fn pattern_value(i:u32, calc_param:u32, kind:u32)->vec4<u32>
+{
+    if kind == KIND_ADDRESS {
+        return address_value(i, calc_param);
+    }
+    // neighboring words differ in every bit: the most bits switching at once on the memory bus
+    var toggled = vec4<u32>(0u, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu);
+    if kind == KIND_CHECKERBOARD {
+        // neighboring bits differ too
+        toggled ^= splat(0x55555555u);
+    }
+    return toggled;
+}
+
 // The pattern is written either as is (xor_mask 0) or bitwise inverted (xor_mask FFFFFFFF),
 // so every bit of the memory holds both 0 and 1 over two iterations
 fn test_value_by_index(i:u32)->vec4<u32>
 {
-    return test_value_for_param(i, io.calc_param) ^ splat(io.xor_mask);
+    return pattern_value(i, io.calc_param, io.kind) ^ splat(io.xor_mask);
 }
 
 
 const TEST_WINDOW_1D_MAX_GROUPS: u32 = 0x4000u;
 const TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY: u32 = 0x2000u;//don't inner-multiply by window size
+// vec4s in TEST_WINDOW_SIZE_GRANULARITY (128MB): windows are a whole number of these
+const GRANULE_VEC4S: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;
+
+// Random access order: within each 128MB granule an affine map modulo the granule size, which
+// is a bijection for an odd multiplier, so every vec4 is still processed exactly once.
+// Neighboring invocations get far apart addresses, which keeps opening new memory rows.
+// The map changes with the pattern (calc_param) and differs between writing and reading (salt).
+fn scattered_index(id: u32, salt: u32) -> u32
+{
+    let mask = GRANULE_VEC4S - 1u;
+    let multiplier = (io.calc_param * 2u + 0x9E3779B1u + salt * 0x6A09E668u) | 1u;
+    let offset = io.iter * 0x632BE5ABu + salt * 0x3C6EF372u;
+    return (id & ~mask) | ((((id & mask) * multiplier) + offset) & mask);
+}
+
+fn invocation_index(global_invocation_id: vec3<u32>) -> u32
+{
+    return global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
+}
+
+// The vec4 a read invocation checks
+fn read_index(effective_invocation_id: u32) -> u32
+{
+    if io.order == ORDER_RANDOM {
+        return scattered_index(effective_invocation_id, 1u);
+    }
+    let addr_mod = effective_invocation_id % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
+    let new_mod = (11 * effective_invocation_id + 999 * io.iter + io.calc_param +  7 * (effective_invocation_id / TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY)) % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
+    return effective_invocation_id - addr_mod + new_mod; //make read order a bit rotated, not strictly sequential
+}
+
+// The vec4 a write invocation writes: different from the read order
+fn write_index(effective_invocation_id: u32) -> u32
+{
+    if io.order == ORDER_RANDOM {
+        return scattered_index(effective_invocation_id, 0u);
+    }
+    let proccessed_mod = effective_invocation_id % GRANULE_VEC4S;
+    return effective_invocation_id + GRANULE_VEC4S - 2 * proccessed_mod - 1;
+}
 
 @compute @workgroup_size(64, 1, 1)
 fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
-    let addr_mod = effective_invocation_id % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
-    let new_mod = (11 * effective_invocation_id + 999 * io.iter + io.calc_param +  7 * (effective_invocation_id / TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY)) % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
-    let effective_addr = effective_invocation_id - addr_mod + new_mod; //make read order a bit rotated, not strictly sequential
+    let effective_addr = read_index(invocation_index(global_invocation_id));
     let actual_value : vec4<u32> = test[effective_addr];
     let expected_value : vec4<u32> = test_value_by_index(effective_addr);
     if any(actual_value != expected_value) {
@@ -76,7 +140,7 @@ fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
         // what this memory held before the last write: lets us tell "write never landed" from corruption
         // stale_mode: 0 - don't check, 1 - previous data as is, 2 - previous data inverted
         let stale_mask : u32 = select(0u, 0xFFFFFFFFu, io.stale_mode == 2u);
-        let stale_value : vec4<u32> = test_value_for_param(effective_addr, io.prev_calc_param) ^ splat(stale_mask);
+        let stale_value : vec4<u32> = pattern_value(effective_addr, io.prev_calc_param, io.prev_kind) ^ splat(stale_mask);
         for(var i: i32 = 0; i < 4; i++) {
             let actual_u32 = actual_value[i];
             let error_mask = actual_u32 ^ expected_value[i];
@@ -120,20 +184,13 @@ fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
 
 @compute @workgroup_size(64, 1, 1)
 fn write(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
-    //make global_invocation_id processing specific memory addr different on writing compared to reading
-    let TEST_WINDOW_SIZE_GRANULARITY: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;//don't inner-multiply by window size
-    let proccessed_mod = effective_invocation_id % TEST_WINDOW_SIZE_GRANULARITY;
-    let proccessed_idx = effective_invocation_id + TEST_WINDOW_SIZE_GRANULARITY - 2 * proccessed_mod - 1;
+    let proccessed_idx = write_index(invocation_index(global_invocation_id));
     test[proccessed_idx] = test_value_by_index(proccessed_idx);
 }
 
 @compute @workgroup_size(64, 1, 1)
 fn emulate_write_bugs(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
-    let TEST_WINDOW_SIZE_GRANULARITY: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;//don't inner-multiply by window size
-    let proccessed_mod = effective_invocation_id % TEST_WINDOW_SIZE_GRANULARITY;
-    let proccessed_idx = effective_invocation_id + TEST_WINDOW_SIZE_GRANULARITY - 2 * proccessed_mod - 1;
+    let proccessed_idx = write_index(invocation_index(global_invocation_id));
     test[proccessed_idx] = test_value_by_index(proccessed_idx);
     if proccessed_idx == 0xADBA {
         test[proccessed_idx][1] ^= 0x400000u;//error simulation for test

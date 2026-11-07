@@ -27,6 +27,75 @@ impl TestDuration {
     }
 }
 
+/// What kind of test runs, chosen with --test or on the start screen
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TestMode {
+    /// the address-based pattern, written and read at full speed
+    #[default]
+    Standard,
+    /// all the test types in turn, then a longer hold: for final checks and suspect cards
+    Thorough,
+    /// bit patterns switching the most memory bus lines at once
+    Bus,
+    /// all patterns, going through memory in random order
+    Random,
+    /// all patterns in bursts of load with idle gaps between them
+    Pulsed,
+}
+
+/// The default duration of the thorough test, which goes through all test types
+pub const THOROUGH_DURATION: Duration = Duration::from_secs(15 * 60);
+
+impl TestMode {
+    pub const ALL: [Self; 5] = [
+        Self::Standard,
+        Self::Thorough,
+        Self::Bus,
+        Self::Random,
+        Self::Pulsed,
+    ];
+
+    /// The name accepted by --test
+    pub fn arg(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Thorough => "thorough",
+            Self::Bus => "bus",
+            Self::Random => "random",
+            Self::Pulsed => "pulsed",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let lower = text.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.arg() == lower)
+            .ok_or_else(|| {
+                format!("unknown test '{text}', use standard, thorough, bus, random or pulsed")
+            })
+    }
+
+    /// What the test does, for the start screen and the test plan
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Standard => "address pattern at full speed",
+            Self::Thorough => "all test types in turn, then a longer hold",
+            Self::Bus => "bus-toggling patterns",
+            Self::Random => "random access order",
+            Self::Pulsed => "pulsed load",
+        }
+    }
+
+    /// The duration used when none is given
+    pub fn default_duration(self) -> TestDuration {
+        match self {
+            Self::Thorough => TestDuration::Limited(THOROUGH_DURATION),
+            _ => TestDuration::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum LogTarget {
     #[default]
@@ -44,6 +113,7 @@ pub struct Options {
     /// Memory to test, in bytes
     pub size: Option<i64>,
     pub duration: TestDuration,
+    pub mode: TestMode,
     /// Maximum size of one test window, in megabytes
     pub window_mb: Option<i64>,
     pub log: LogTarget,
@@ -71,13 +141,21 @@ Usage: memtest_vulkan [OPTIONS]
 Tests GPU video memory (VRAM) for errors using Vulkan compute shaders.
 Without options it lists the GPUs and starts the standard 5-minute test after a
 short countdown. Before that you can type a GPU number, or press S for settings:
-the GPU, the duration, the memory size and stopping at the first error.
+the GPU, the test, the duration, the memory size and stopping at the first error.
 
 Options:
   -d, --device <N>       Test GPU number N as shown in the list (no prompt)
   -s, --size <SIZE>      Memory to test, like 4G or 512M (default: all free VRAM)
   -t, --duration <TIME>  How long to test, like 30s, 10m, 2h or \"endless\"
-                         (default: 5m, the standard test)
+                         (default: 5m, the standard test; 15m for thorough)
+      --test <TEST>      What to test with (default: standard):
+                           standard  address-based pattern at full speed
+                           thorough  all of the tests below in turn, then a
+                                     longer idle hold before a last check
+                           bus       bit patterns switching the most memory
+                                     bus lines at once
+                           random    all patterns in random access order
+                           pulsed    all patterns in bursts of load
   -w, --window-mb <MB>   Limit one test window to MB megabytes (128MB steps,
                          default up to 1024). If errors disappear with small
                          windows, like 256, they come from the driver
@@ -191,6 +269,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     }
 
     let mut options = Options::default();
+    let mut duration_given = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         let (name, inline_value) = match arg.split_once('=') {
@@ -231,7 +310,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             "-s" | "--size" => options.size = Some(parse_size(&value("a size like 4G")?)?),
             "-t" | "--duration" => {
                 options.duration = parse_duration(&value("a time like 10m")?)?;
+                duration_given = true;
             }
+            "--test" => options.mode = TestMode::parse(&value("a test like thorough")?)?,
             "-w" | "--window-mb" => {
                 let text = value("a size in megabytes")?;
                 let mb = text
@@ -254,6 +335,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             _ => return Err(format!("unknown option '{arg}', see --help")),
         }
     }
+    if !duration_given {
+        options.duration = options.mode.default_duration();
+    }
     Ok(Command::Run(options))
 }
 
@@ -266,6 +350,30 @@ mod tests {
             Ok(Command::Run(options)) => options,
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_mode_sets_the_default_duration() {
+        let thorough = run(&["--test", "thorough"]);
+        assert_eq!(thorough.mode, TestMode::Thorough);
+        assert_eq!(thorough.duration, TestDuration::Limited(THOROUGH_DURATION));
+        // a given duration wins, wherever it is
+        for args in [
+            ["--test", "Thorough", "-t", "2m"],
+            ["-t", "2m", "--test", "thorough"],
+        ] {
+            let options = run(&args);
+            assert_eq!(options.mode, TestMode::Thorough);
+            assert_eq!(
+                options.duration,
+                TestDuration::Limited(Duration::from_secs(120))
+            );
+        }
+        for mode in TestMode::ALL {
+            assert_eq!(run(&["--test", mode.arg()]).mode, mode);
+        }
+        assert_eq!(run(&["--test=bus"]).duration, TestDuration::default());
+        assert!(parse(["--test", "fast"].map(OsString::from)).is_err());
     }
 
     #[test]

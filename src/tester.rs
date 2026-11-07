@@ -2,12 +2,13 @@
 
 use crate::{
     ProcessEnv,
-    cli::{STANDARD_DURATION, TestDuration},
+    cli::{STANDARD_DURATION, TestDuration, TestMode},
     close,
     devices::NamedComputeDevice,
     display_this_process_result,
-    iobuf::{ErrorTotals, IOBuf, Pattern},
+    iobuf::{AccessOrder, ErrorTotals, IOBuf, Pattern},
     output, ram,
+    schedule::{Pulse, Schedule},
     shader::{
         ALLOCATION_TRY_STEP, ELEMENT_SIZE, EMULATE_ALLOCATION_LIMIT_ENV, EMULATE_FAILURE_ENV,
         EMULATE_SKIPPED_WRITE_ENV, GB, MAP_FOR_GETTING_ADDRESS_SIZE, MAX_WINDOW_MB_ENV,
@@ -34,8 +35,6 @@ type BoxResult<T> = Result<T, Box<dyn Error>>;
 /// A GPU pass not finishing in this time is treated as a GPU hang
 const PASS_HANG_TIMEOUT: Duration = Duration::from_secs(60);
 const FENCE_WAIT_SLICE_NS: u64 = 1_000_000_000;
-/// Pause of the GPU load near the end of the test: checks memory left idle while the GPU is hot
-const LOAD_PAUSE: Duration = Duration::from_secs(15);
 const REPORT_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the progress line on the console is updated
 const LIVE_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -182,6 +181,8 @@ struct Tester<'a> {
     gpu_hung: Cell<bool>,
     /// GPU passes run so far
     passes: Cell<u32>,
+    /// The order the passes go through memory
+    order: Cell<AccessOrder>,
     emulated_failure: Option<(EmulatedFailure, u32)>,
 }
 
@@ -333,6 +334,7 @@ impl<'a> Tester<'a> {
             window_size: 0,
             gpu_hung: Cell::new(false),
             passes: Cell::new(0),
+            order: Cell::new(AccessOrder::Sequential),
             emulated_failure: env::var(EMULATE_FAILURE_ENV)
                 .ok()
                 .and_then(|text| parse_emulated_failure(&text)),
@@ -419,7 +421,8 @@ impl<'a> Tester<'a> {
         Ok(())
     }
 
-    fn io_write(&self, io: IOBuf) {
+    fn io_write(&self, mut io: IOBuf) {
+        io.set_order(self.order.get());
         unsafe { std::ptr::write(self.mapped, io) }
     }
 
@@ -612,8 +615,12 @@ impl<'a> Tester<'a> {
         let test_elems = self.window_size / ELEMENT_SIZE;
         writeln!(
             log_dupler,
-            "Error found. Mode {}, total errors 0x{:X} out of 0x{:X} ({:2.8}%)\nErrors address range: {:?}  iteration:{}\n{}",
+            "Error found. Mode {}{}, total errors 0x{:X} out of 0x{:X} ({:2.8}%)\nErrors address range: {:?}  iteration:{}\n{}",
             mode.name(),
+            io_out
+                .pattern_note()
+                .map(|note| format!(" ({note})"))
+                .unwrap_or_default(),
             total_errors,
             test_elems,
             total_errors as f64 / test_elems as f64 * 100.0f64,
@@ -1012,19 +1019,19 @@ fn test_device<Writer: std::io::Write>(
         );
     }
     writeln!(log_dupler, "Testing {}", selected.label)?;
-    writeln!(
-        log_dupler,
-        "Test plan: {:.1}GB as {} windows of {:.3}GB, duration {}{}",
+    let plan = format!(
+        "{:.1}GB as {} windows of {:.3}GB, duration {}{}",
         tester.tested_bytes() as f32 / GB,
         tester.window_count(),
         tester.window_size as f32 / GB,
         format_test_duration(env.options.duration),
-        if env.options.duration == TestDuration::default() {
-            " (standard test)"
-        } else {
-            ""
+        match Schedule::new(env.options.mode, env.options.duration).description() {
+            Some(description) => format!(", {description}"),
+            None if env.options.duration == TestDuration::default() => " (standard test)".into(),
+            None => String::new(),
         }
-    )?;
+    );
+    writeln!(log_dupler, "{}", text::wrap("Test plan: ", &plan))?;
 
     if std::io::stdout().is_terminal() {
         log_dupler.enable_live_line();
@@ -1172,6 +1179,22 @@ fn windows_to_drop(slow: &[usize], active: &[bool]) -> Vec<usize> {
         .collect()
 }
 
+/// In a pulsed phase, called after each pass: idles the GPU when a burst of load is over.
+/// Returns true if Ctrl+C was pressed meanwhile.
+fn pulsed_gap(pulse: &mut Pulse) -> bool {
+    let Some(gap) = pulse.after_pass(Instant::now()) else {
+        return false;
+    };
+    let gap_end = Instant::now() + gap;
+    while let Some(left) = gap_end.checked_duration_since(Instant::now()) {
+        std::thread::sleep(min(left, Duration::from_millis(50)));
+        if close::close_requested() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Drops windows the driver placed in system RAM (found by `find_slow_windows`), so the rest of
 /// the test checks VRAM only. Window 0 holds the re-read data and at least one other window is
 /// needed for the write test, so if those are slow they're kept: then returns a warning instead.
@@ -1238,15 +1261,23 @@ fn main_loop<Writer: std::io::Write>(
         TestDuration::Limited(target) => Some(target),
         TestDuration::Endless => None,
     };
-    // pause the load once, 30 seconds before the (standard) test end, then re-check all windows
-    let pause_at = match target {
-        Some(target) if target < Duration::from_secs(60) => None,
-        _ => target
-            .unwrap_or(STANDARD_DURATION)
-            .checked_sub(Duration::from_secs(30)),
-    };
+    // what each part of the test runs, and the hold: the load pauses once near the end
+    // (or the standard test time), then all windows are checked again
+    let schedule = Schedule::new(env.options.mode, duration);
+    let pause_at = schedule.pause_at();
+    let hold = schedule.hold();
     let mut paused = false;
-    let announce_standard_result = target.is_none_or(|target| target > STANDARD_DURATION);
+    let announce_standard_result = env.options.mode == TestMode::Standard
+        && target.is_none_or(|target| target > STANDARD_DURATION);
+    // The pattern each window holds now and held before its last write: what a read expects,
+    // and what it finds if the write never reached memory. The initial fill wrote them all.
+    let mut written = vec![Pattern::initial(); window_count];
+    let mut before = written.clone();
+    let mut phase = schedule.phase_at(Duration::ZERO);
+    let mut kind = phase.kinds[0];
+    let mut pairs = 0usize;
+    let mut pulse = Pulse::default();
+    let multi_phase = env.options.mode == TestMode::Thorough;
     let mut standard_announced = false;
     let mut swap_warning: Option<String> = None;
     let mut skipped_windows: Vec<usize> = Vec::new();
@@ -1278,6 +1309,26 @@ fn main_loop<Writer: std::io::Write>(
         if stopped_on_error {
             break;
         }
+        // Iterations come in pairs: a pattern, then the same one inverted. The phase and the
+        // pattern kind change only between pairs, so each pair flips every bit.
+        if iteration % 2 == 1 {
+            let next_phase = schedule.phase_at(start.elapsed());
+            if next_phase != phase {
+                phase = next_phase;
+                pairs = 0;
+            }
+            if multi_phase && (iteration == 1 || pairs == 0) {
+                writeln!(
+                    log_dupler,
+                    "{:>7}  Testing with {}",
+                    format_duration(start.elapsed()),
+                    phase.name
+                )?;
+            }
+            kind = phase.kinds[pairs % phase.kinds.len()];
+            pairs += 1;
+            tester.order.set(phase.order);
+        }
         // write all windows except window 0, which keeps the initial data to check retention
         for window_idx in 1..window_count {
             if !tester.is_active(window_idx) {
@@ -1290,14 +1341,12 @@ fn main_loop<Writer: std::io::Write>(
             } else {
                 Some(tester.pipelines.emulate_write_bugs)
             };
-            period.write_time += tester.write_window(
-                window_idx,
-                Pattern::for_iteration(buffer_in.iter, window_idx as i64),
-                false,
-                write_pipeline,
-            )?;
+            let pattern = Pattern::of_kind(kind, buffer_in.iter, window_idx as i64);
+            before[window_idx] = written[window_idx];
+            written[window_idx] = pattern;
+            period.write_time += tester.write_window(window_idx, pattern, false, write_pipeline)?;
             period.written += tester.window_size;
-            if close::close_requested() {
+            if close::close_requested() || (phase.pulsed && pulsed_gap(&mut pulse)) {
                 stop_requested = true;
                 break 'test;
             }
@@ -1314,14 +1363,16 @@ fn main_loop<Writer: std::io::Write>(
                 writeln!(
                     log_dupler,
                     "Pausing the GPU load for {} seconds, then checking all memory again...",
-                    LOAD_PAUSE.as_secs()
+                    hold.as_secs()
                 )?;
+                // stay on the patterns just written: the check finds data that faded
+                tester.order.set(AccessOrder::Sequential);
                 let pause_start = Instant::now();
-                while pause_start.elapsed() < LOAD_PAUSE {
+                while pause_start.elapsed() < hold {
                     log_dupler.show_live_line(&format!(
                         "  Pausing the GPU load: {}s left",
                         // saturating: the pause may end between the loop check and here
-                        LOAD_PAUSE.saturating_sub(pause_start.elapsed()).as_secs() + 1
+                        hold.saturating_sub(pause_start.elapsed()).as_secs() + 1
                     ));
                     std::thread::sleep(Duration::from_millis(250));
                     if close::close_requested() {
@@ -1341,15 +1392,11 @@ fn main_loop<Writer: std::io::Write>(
                     io
                 } else {
                     let mut io = buffer_in;
-                    io.set_pattern(Pattern::for_iteration(buffer_in.iter, window_idx as i64));
+                    io.set_pattern(written[window_idx]);
                     // The data this window held before this iteration's write: the initial fill
                     // or the previous iteration's write.
                     // Reading it back means this iteration's write never reached memory.
-                    io.set_previous_pattern(Some(if iteration == 1 {
-                        Pattern::initial()
-                    } else {
-                        Pattern::for_iteration(buffer_in.iter.wrapping_sub(1), window_idx as i64)
-                    }));
+                    io.set_previous_pattern(Some(before[window_idx]));
                     io
                 };
                 let (io_out, read_time) = tester.read_window(window_idx, io_in)?;
@@ -1373,12 +1420,16 @@ fn main_loop<Writer: std::io::Write>(
                         break 'test;
                     }
                 }
-                if close::close_requested() {
+                // no gaps in the check after the hold, which should follow it right away
+                if close::close_requested() || (phase.pulsed && pass == 0 && pulsed_gap(&mut pulse))
+                {
                     stop_requested = true;
                     break 'test;
                 }
             }
         }
+        // the hold's check reads in sequential order: back to the phase's order
+        tester.order.set(phase.order);
         iterations = iteration as u32;
         buffer_in.prepare_next_iter_write();
 
@@ -1467,8 +1518,9 @@ fn main_loop<Writer: std::io::Write>(
         close::raise_status_bit(close::app_status::COMPLETED);
     }
     // stopping an endless or long test after the standard 5 minutes still gives a full result
+    // (the thorough test needs all of its parts)
     let elapsed = start.elapsed();
-    let required = target.map_or(STANDARD_DURATION, |target| target.min(STANDARD_DURATION));
+    let required = schedule.required();
     Ok(RunReport {
         elapsed,
         iterations,
@@ -1484,17 +1536,20 @@ fn main_loop<Writer: std::io::Write>(
 }
 
 /// What to do after the test, for each kind of result
-fn next_steps(totals: &ErrorTotals, completed: bool) -> &'static str {
+fn next_steps(totals: &ErrorTotals, completed: bool, mode: TestMode) -> &'static str {
     if totals.unwritten > 0 {
-        "Retry with --window-mb 512, or update or change the GPU driver, and see Troubleshooting \
+        "Retry with --window-mb 256, or update or change the GPU driver, and see Troubleshooting \
          in the README. Faulty VRAM gives scattered errors, not this pattern."
     } else if totals.memory_errors > 0 {
         "If the GPU memory is overclocked or undervolted, go back to stock settings and test \
          again. If errors remain at stock settings, check the GPU temperatures and cooling. \
          Errors at stock settings and normal temperatures point to faulty VRAM."
+    } else if completed && mode == TestMode::Thorough {
+        "Nothing to fix. When tuning an overclock, this setting passed all test types: for the \
+         final setting, a longer run like --duration 1h adds confidence."
     } else if completed {
         "Nothing to fix. When tuning an overclock, this setting passed: you can try the next \
-         step, and confirm the final setting with a longer test, like --duration 1h."
+         step, and confirm the final setting with the thorough test (--test thorough)."
     } else {
         "Run the full test (the standard 5 minutes or longer) for a reliable result."
     }
@@ -1526,6 +1581,9 @@ fn write_summary<Writer: std::io::Write>(
             _ => String::new(),
         }
     )?;
+    if let Some(description) = Schedule::new(env.options.mode, env.options.duration).description() {
+        writeln!(log_dupler, "{}", text::wrap("Test:       ", &description))?;
+    }
     writeln!(
         log_dupler,
         "Throughput: written {:.1}GB at {:.1}GB/s, checked {:.1}GB at {:.1}GB/s",
@@ -1563,6 +1621,7 @@ fn write_summary<Writer: std::io::Write>(
         )
     } else if report.completed
         && report.stopped_by_user
+        && env.options.mode != TestMode::Thorough
         && env.options.duration != TestDuration::default()
     {
         "PASSED - no errors found (stopped by Ctrl+C after the standard 5 minutes)".to_owned()
@@ -1581,7 +1640,10 @@ fn write_summary<Writer: std::io::Write>(
     writeln!(
         log_dupler,
         "{}",
-        text::wrap("Next steps: ", next_steps(totals, report.completed))
+        text::wrap(
+            "Next steps: ",
+            next_steps(totals, report.completed, env.options.mode)
+        )
     )?;
     if !report.skipped_windows.is_empty() {
         let skipped = format!(
@@ -1719,12 +1781,12 @@ mod tests {
     #[test]
     fn next_steps_match_the_result() {
         let mut totals = ErrorTotals::default();
-        assert!(next_steps(&totals, true).contains("Nothing to fix"));
-        assert!(next_steps(&totals, false).contains("full test"));
+        assert!(next_steps(&totals, true, TestMode::Standard).contains("--test thorough"));
+        assert!(next_steps(&totals, false, TestMode::Standard).contains("full test"));
         totals.memory_errors = 3;
-        assert!(next_steps(&totals, true).contains("stock settings"));
+        assert!(next_steps(&totals, true, TestMode::Standard).contains("stock settings"));
         totals.unwritten = 100;
-        assert!(next_steps(&totals, true).contains("--window-mb 512"));
+        assert!(next_steps(&totals, true, TestMode::Standard).contains("--window-mb 256"));
     }
 
     #[test]

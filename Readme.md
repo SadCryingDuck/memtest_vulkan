@@ -15,7 +15,7 @@ GitHub users also may want to try [CI build artifacts](https://github.com/SadCry
 
 Release files are built by GitHub Actions and come with a signed build record. To check that a download was built by this repository from its published source, use the [GitHub CLI](https://cli.github.com): `gh attestation verify memtest_vulkan-v0.12.0-duck-windows-x86_64.exe -R SadCryingDuck/memtest_vulkan`
 
-Start test by double-clicking the utility, no installation / parameters / configuration / admin-rights required. The test starts by itself after a short countdown. Before that, you can type the number of the GPU to test, or press S (or an arrow key) to open the settings: the GPU, the duration (from a 1-minute check to an endless test), the amount of memory, and stopping the test at the first error, which is handy when tuning an overclock. Up/Down choose a setting and Left/Right change it, or type a number for a custom value: minutes for the duration, GB for the memory. G, D, M and E are shortcuts for the four settings. Enter starts the test, Esc quits.
+Start test by double-clicking the utility, no installation / parameters / configuration / admin-rights required. The test starts by itself after a short countdown. Before that, you can type the number of the GPU to test, or press S (or an arrow key) to open the settings: the GPU, the [test](#test-types) (standard, or thorough for final checks), the duration (from a 1-minute check to an endless test), the amount of memory, and stopping the test at the first error, which is handy when tuning an overclock. Up/Down choose a setting and Left/Right change it, or type a number for a custom value: minutes for the duration, GB for the memory. G, T, D, M and E are shortcuts for the five settings. Enter starts the test, Esc quits.
 
 While testing, a progress line shows the time, a progress bar, the speed and the errors found so far. At the first error the console beeps and its taskbar button flashes, so errors get noticed even in a minimized window. The summary at the end says what to do next.
 ![WindowsScreenshot](.github/memtest_vulkan_windows_rtx2070.png)
@@ -74,7 +74,8 @@ All options are optional, `memtest_vulkan --help` lists them:
 |---|---|
 | `-d, --device <N>` | Test GPU number N as shown in the list, without the selection prompt |
 | `-s, --size <SIZE>` | Memory to test, like `4G` or `512M` (default: all free VRAM) |
-| `-t, --duration <TIME>` | How long to test, like `30s`, `10m`, `2h` or `endless` (default: `5m`, the standard test) |
+| `-t, --duration <TIME>` | How long to test, like `30s`, `10m`, `2h` or `endless` (default: `5m`, the standard test; `15m` for the thorough test) |
+| `--test <TEST>` | What to test with: `standard` (default), `thorough`, `bus`, `random` or `pulsed`, see [Test types](#test-types) |
 | `-w, --window-mb <MB>` | Limit one test window to MB megabytes (128MB steps), to tell driver problems from memory errors |
 | `--log <FILE>`, `--no-log` | Log file location (default: `memtest_vulkan.log` in the current folder), or no log |
 | `-e, --stop-on-error` | End the test at the first error, like when tuning an overclock |
@@ -82,7 +83,7 @@ All options are optional, `memtest_vulkan --help` lists them:
 | `-b, --batch` | No prompts and no key press at the end, for scripts |
 | `-v, --verbose` | Print diagnostic information (renaming the executable to `memtest_vulkan_verbose` works too) |
 
-Press Ctrl+C once to stop testing and show the results, twice to quit at once. A test stopped after the standard 5 minutes still counts as complete. With `--device` or `--batch` the start screen is skipped, so scripts start testing at once.
+Press Ctrl+C once to stop testing and show the results, twice to quit at once. A test stopped after the standard 5 minutes still counts as complete (the thorough test needs its whole duration). With `--device` or `--batch` the start screen is skipped, so scripts start testing at once.
 
 The exit code tells the result, which is useful in scripts (`memtest_vulkan --batch --duration 1h`):
 
@@ -215,6 +216,20 @@ use Ctrl+C to stop it when you decide it's enough
 memtest_vulkan: no any errors, testing PASSed.
   press any key to continue...
 </pre></details>
+
+### Test types
+
+Different memory faults show up under different conditions, so besides the standard test there are tests that stress the memory in other ways:
+
+| Test | What it does | Good for |
+|---|---|---|
+| `standard` | Values derived from each address, then the same inverted, written and read at full speed | Most problems: a quick, reliable check |
+| `bus` | 00000000/FFFFFFFF and 55555555/AAAAAAAA alternating word by word, so the most bits switch at once on the memory bus | Overclocked memory, which tends to fail when many bus lines switch together |
+| `random` | All patterns, going through memory in random order, so nearly every access opens another memory row | The memory timings, rather than the bandwidth |
+| `pulsed` | All patterns in bursts of load from 0.1 to 2 seconds with idle gaps between them | Errors from the power and clock changes of an uneven load, like in games |
+| `thorough` | All of the above in turn, then a longer idle hold (10% of the time, 30 seconds to 5 minutes) before checking all memory again | Final checks of an overclock, and suspect cards: the hold finds cells that slowly lose their data |
+
+Every test writes each pattern as is and then inverted, so every bit holds both 0 and 1, and keeps the window that's never rewritten to check that data stays intact. The thorough test lasts 15 minutes unless a duration is given. The memory bus layout and the data bus inversion of GDDR memory differ between cards, so no pattern is guaranteed to be the worst case for a particular card: that's why the thorough test uses several.
 
 # Interpreting the results
 

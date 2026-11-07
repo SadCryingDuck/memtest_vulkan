@@ -5,7 +5,7 @@
 //! show; `show` only reads the keys and draws the lines, so the logic is testable on its own.
 
 use crate::{
-    cli::{STANDARD_DURATION, TestDuration},
+    cli::{STANDARD_DURATION, TestDuration, TestMode},
     shader::{GB, MIN_WANTED_ALLOCATION},
     tester::format_duration,
 };
@@ -26,6 +26,7 @@ use std::{
 pub struct Settings {
     /// index in the device list
     pub device: usize,
+    pub mode: TestMode,
     pub duration: TestDuration,
     /// memory to test, None for all free memory
     pub size: Option<i64>,
@@ -123,13 +124,35 @@ pub fn describe_duration(duration: TestDuration) -> String {
     }
 }
 
-/// Short form for the countdown line, like "standard 5-minute test" or "15:00 test"
-fn describe_test(duration: TestDuration) -> String {
-    match duration {
-        TestDuration::Limited(d) if d == STANDARD_DURATION => "standard 5-minute test".to_owned(),
-        TestDuration::Limited(d) => format!("{} test", format_duration(d)),
-        TestDuration::Endless => "endless test".to_owned(),
+/// Short form for the countdown line, like "standard 5-minute test" or "15:00 thorough test"
+fn describe_test(settings: &Settings) -> String {
+    let length = match settings.duration {
+        TestDuration::Limited(d)
+            if d == STANDARD_DURATION && settings.mode == TestMode::Standard =>
+        {
+            return "standard 5-minute test".to_owned();
+        }
+        TestDuration::Limited(d) => format_duration(d),
+        TestDuration::Endless => "endless".to_owned(),
+    };
+    match settings.mode {
+        TestMode::Standard => format!("{length} test"),
+        mode => format!("{length} {} test", mode.arg()),
     }
+}
+
+/// The next (`forward`) or previous test mode, wrapping around
+fn step_mode(current: TestMode, forward: bool) -> TestMode {
+    let count = TestMode::ALL.len();
+    let index = TestMode::ALL
+        .iter()
+        .position(|m| *m == current)
+        .unwrap_or(0);
+    TestMode::ALL[if forward {
+        (index + 1) % count
+    } else {
+        (index + count - 1) % count
+    }]
 }
 
 pub fn describe_size(size: Option<i64>, testable: i64) -> String {
@@ -166,12 +189,19 @@ pub enum Key {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Row {
     Gpu,
+    Test,
     Duration,
     Memory,
     StopOnError,
 }
 
-const ROWS: [Row; 4] = [Row::Gpu, Row::Duration, Row::Memory, Row::StopOnError];
+const ROWS: [Row; 5] = [
+    Row::Gpu,
+    Row::Test,
+    Row::Duration,
+    Row::Memory,
+    Row::StopOnError,
+];
 
 /// The settings menu: a highlighted row whose value arrows change, letter shortcuts, and typed
 /// custom values
@@ -183,6 +213,8 @@ pub struct Menu<'a> {
     editing: Option<String>,
     /// shown once in the hint line, like a rejected custom value
     message: Option<String>,
+    /// the user changed the duration: changing the test keeps it
+    duration_chosen: bool,
 }
 
 impl<'a> Menu<'a> {
@@ -193,6 +225,7 @@ impl<'a> Menu<'a> {
             selected: 0,
             editing: None,
             message: None,
+            duration_chosen: false,
         }
     }
 
@@ -233,7 +266,18 @@ impl<'a> Menu<'a> {
                 };
                 self.choose_device(device);
             }
-            Row::Duration => settings.duration = step_duration(settings.duration, forward),
+            Row::Test => {
+                let mode = step_mode(settings.mode, forward);
+                // a duration left at the old test's default follows the new test's
+                if !self.duration_chosen && settings.duration == settings.mode.default_duration() {
+                    settings.duration = mode.default_duration();
+                }
+                settings.mode = mode;
+            }
+            Row::Duration => {
+                settings.duration = step_duration(settings.duration, forward);
+                self.duration_chosen = true;
+            }
             Row::Memory => {
                 settings.size = step_size(
                     settings.size,
@@ -264,6 +308,7 @@ impl<'a> Menu<'a> {
                 if value >= 1.0 && value <= MAX_CUSTOM_MINUTES as f64 {
                     self.settings.duration =
                         TestDuration::Limited(Duration::from_secs((value * 60.0).round() as u64));
+                    self.duration_chosen = true;
                 } else {
                     self.message = Some(format!(
                         "Type 1 to {MAX_CUSTOM_MINUTES} minutes, or use Left/Right for endless"
@@ -282,7 +327,7 @@ impl<'a> Menu<'a> {
                     ));
                 }
             }
-            Row::StopOnError => {}
+            Row::Test | Row::StopOnError => {}
         }
     }
 
@@ -319,12 +364,15 @@ impl<'a> Menu<'a> {
             Key::Left => self.step(self.row(), false),
             Key::Right => self.step(self.row(), true),
             Key::Char(' ') if self.row() == Row::StopOnError => self.step(Row::StopOnError, true),
-            Key::Char(c) if c.is_ascii_digit() && self.row() != Row::StopOnError => {
+            Key::Char(c)
+                if c.is_ascii_digit() && !matches!(self.row(), Row::Test | Row::StopOnError) =>
+            {
                 self.editing = Some(c.to_string())
             }
             Key::Char(c) => {
                 let row = match c.to_ascii_lowercase() {
                     'g' => Row::Gpu,
+                    't' => Row::Test,
                     'd' => Row::Duration,
                     'm' => Row::Memory,
                     'e' => Row::StopOnError,
@@ -352,6 +400,11 @@ impl<'a> Menu<'a> {
                     Row::Gpu,
                     format!("{}: {}", self.settings.device + 1, device.label)
                 )
+            ),
+            format!(
+                "T  Test                 {}: {}",
+                self.settings.mode.arg(),
+                self.settings.mode.description()
             ),
             format!(
                 "D  Duration             {}",
@@ -390,6 +443,9 @@ impl<'a> Menu<'a> {
         } else {
             match self.row() {
                 Row::Gpu => "Left/Right or type a number to choose the GPU",
+                Row::Test => {
+                    "Left/Right to choose: standard for quick checks, thorough for final checks"
+                }
                 Row::Duration => "Left/Right to change, or type a number of minutes",
                 Row::Memory => "Left/Right to change, or type a number of GB",
                 Row::StopOnError => "Left/Right or Space: end the test at the first error",
@@ -501,14 +557,14 @@ fn run(
             let seconds_left = countdown.saturating_sub(start.elapsed()).as_secs() + 1;
             format!(
                 "Starting the {} of GPU {} in {seconds_left} second{}",
-                describe_test(settings.duration),
+                describe_test(&settings),
                 settings.device + 1,
                 if seconds_left == 1 { "" } else { "s" }
             )
         } else {
             format!(
                 "Ready: the {} of GPU {}",
-                describe_test(settings.duration),
+                describe_test(&settings),
                 settings.device + 1
             )
         };
@@ -644,10 +700,19 @@ mod tests {
             "5:00 (standard test)"
         );
         assert_eq!(describe_duration(minutes(60)), "1:00:00");
-        assert_eq!(
-            describe_test(TestDuration::default()),
-            "standard 5-minute test"
-        );
+        assert_eq!(describe_test(&defaults()), "standard 5-minute test");
+        let thorough = Settings {
+            mode: TestMode::Thorough,
+            duration: minutes(15),
+            ..defaults()
+        };
+        assert_eq!(describe_test(&thorough), "15:00 thorough test");
+        let endless_bus = Settings {
+            mode: TestMode::Bus,
+            duration: TestDuration::Endless,
+            ..defaults()
+        };
+        assert_eq!(describe_test(&endless_bus), "endless bus test");
         assert_eq!(
             describe_size(None, 107 * GIB / 10),
             "all free memory (about 10.7GB)"
@@ -672,6 +737,7 @@ mod tests {
     fn defaults() -> Settings {
         Settings {
             device: 0,
+            mode: TestMode::Standard,
             duration: TestDuration::default(),
             size: None,
             stop_on_error: false,
@@ -688,6 +754,7 @@ mod tests {
         let devices = devices();
         let mut menu = Menu::new(&devices, defaults());
         press(&mut menu, &[Key::Right]); // GPU 2
+        press(&mut menu, &[Key::Down, Key::Left]); // standard -> pulsed test
         press(&mut menu, &[Key::Down, Key::Left, Key::Left]); // 5:00 -> 1:00 -> endless
         press(&mut menu, &[Key::Down, Key::Left]); // all memory -> 4GB (AMD has 5GB)
         press(&mut menu, &[Key::Down, Key::Char(' ')]);
@@ -696,6 +763,7 @@ mod tests {
             outcome,
             Some(Outcome::Start(Settings {
                 device: 1,
+                mode: TestMode::Pulsed,
                 duration: TestDuration::Endless,
                 size: Some(4 * GIB),
                 stop_on_error: true,
@@ -716,11 +784,40 @@ mod tests {
         assert_eq!(menu.settings.size, Some(GIB));
         assert!(menu.settings.stop_on_error);
         let (lines, selected, _) = menu.lines();
-        assert_eq!(selected, 3);
+        assert_eq!(selected, 4);
         assert!(
-            lines[3].starts_with("> E  Stop at first error  yes"),
+            lines[4].starts_with("> E  Stop at first error  yes"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn choosing_the_thorough_test_lengthens_a_default_duration() {
+        let devices = devices();
+        let mut menu = Menu::new(&devices, defaults());
+        press(&mut menu, &[Key::Char('t')]);
+        assert_eq!(menu.settings.mode, TestMode::Thorough);
+        assert_eq!(menu.settings.duration, minutes(15));
+        let (lines, selected, _) = menu.lines();
+        assert_eq!(selected, 1);
+        assert!(
+            lines[1].starts_with("> T  Test                 thorough: "),
+            "{lines:?}"
+        );
+        // and back to the standard 5 minutes
+        press(&mut menu, &[Key::Left]);
+        assert_eq!(menu.settings.mode, TestMode::Standard);
+        assert_eq!(menu.settings.duration, TestDuration::default());
+        // a duration the user chose stays
+        press(&mut menu, &[Key::Char('d'), Key::Char('t')]);
+        assert_eq!(menu.settings.mode, TestMode::Thorough);
+        assert_eq!(menu.settings.duration, minutes(15));
+        press(&mut menu, &[Key::Char('t')]);
+        assert_eq!(menu.settings.mode, TestMode::Bus);
+        assert_eq!(menu.settings.duration, minutes(15));
+        // digits don't start typing on the test row
+        press(&mut menu, &[Key::Char('t'), Key::Char('3')]);
+        assert!(menu.editing.is_none());
     }
 
     #[test]
@@ -745,9 +842,12 @@ mod tests {
     fn typed_custom_values() {
         let devices = devices();
         let mut menu = Menu::new(&devices, defaults());
-        press(&mut menu, &[Key::Down, Key::Char('4'), Key::Char('5')]);
+        press(
+            &mut menu,
+            &[Key::Down, Key::Down, Key::Char('4'), Key::Char('5')],
+        );
         let (lines, _, hint) = menu.lines();
-        assert!(lines[1].ends_with("45_"), "{lines:?}");
+        assert!(lines[2].ends_with("45_"), "{lines:?}");
         assert!(hint.contains("minutes"), "{hint}");
         press(&mut menu, &[Key::Enter]);
         assert_eq!(menu.settings.duration, minutes(45));

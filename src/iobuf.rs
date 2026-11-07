@@ -90,32 +90,84 @@ pub struct IOBuf {
     pub stale_mode: u32,
     /// the pattern is written and expected XORed with this: 0 as is, FFFFFFFF inverted
     pub xor_mask: u32,
+    /// PatternKind of the pattern
+    pub kind: u32,
+    /// PatternKind of the window's previous data
+    pub prev_kind: u32,
+    /// AccessOrder of the pass
+    pub order: u32,
+    /// keeps first_elem 16-byte aligned, like vec4 in WGSL
+    pub reserved: u32,
     pub first_elem: MostlyZeroArr<VEC_SIZE>,
 }
 
-/// The values a window is written with: the pattern for calc_param, as is or inverted
+/// What a pattern is made of. The values must match the shader's KIND_ constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatternKind {
+    /// derived from the address, so every value differs: finds data landing at a wrong
+    /// address, and changes with every pair of iterations
+    Address = 0,
+    /// 00000000 and FFFFFFFF alternating word by word: the most bits switching at once on the
+    /// memory bus, which is where overclocked memory tends to fail
+    WordToggle = 1,
+    /// 55555555 and AAAAAAAA alternating word by word: neighboring bits differ too
+    Checkerboard = 2,
+}
+
+impl PatternKind {
+    pub fn from_u32(value: u32) -> Option<Self> {
+        [Self::Address, Self::WordToggle, Self::Checkerboard]
+            .into_iter()
+            .find(|kind| *kind as u32 == value)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Address => "address",
+            Self::WordToggle => "word toggle",
+            Self::Checkerboard => "checkerboard",
+        }
+    }
+}
+
+/// The order a pass goes through memory. The values must match the shader's ORDER_ constants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccessOrder {
+    /// in long runs, as fast as the memory streams data
+    #[default]
+    Sequential = 0,
+    /// scattered over 128MB at a time, so nearly every access opens another memory row:
+    /// stresses the memory timings instead of the bandwidth
+    Random = 1,
+}
+
+/// The values a window is written with: the pattern kind for calc_param, as is or inverted
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pattern {
     pub calc_param: u32,
     pub inverted: bool,
+    pub kind: PatternKind,
 }
 
 impl Pattern {
     /// The initial fill of every window, kept by window 0 for the whole test
     pub fn initial() -> Self {
-        Self {
-            calc_param: IOBuf::calc_param_for(1, 0),
-            inverted: false,
-        }
+        Self::for_iteration(1, 0)
     }
 
-    /// Pattern written to window `window_idx` on iteration `iter` (from 1) of the main loop.
+    /// Address pattern written to window `window_idx` on iteration `iter` (from 1)
+    pub fn for_iteration(iter: u32, window_idx: i64) -> Self {
+        Self::of_kind(PatternKind::Address, iter, window_idx)
+    }
+
+    /// Pattern of `kind` written to window `window_idx` on iteration `iter` (from 1).
     /// Iterations come in pairs writing the same pattern as is, then inverted, so every bit
     /// of the memory holds both 0 and 1 and flips between them.
-    pub fn for_iteration(iter: u32, window_idx: i64) -> Self {
+    pub fn of_kind(kind: PatternKind, iter: u32, window_idx: i64) -> Self {
         Self {
             calc_param: IOBuf::calc_param_for(iter.div_ceil(2), window_idx),
             inverted: iter.is_multiple_of(2),
+            kind,
         }
     }
 
@@ -126,20 +178,26 @@ impl Pattern {
     /// Expected value of the u32 at `index` in the window, as computed by the shader
     #[allow(clippy::manual_rotate)] // this is kept as similar to WGSL shader as possible
     pub fn value(self, index: u32) -> u32 {
-        // wrapping like u32 arithmetic in the shader (avoids overflow panics in debug builds)
-        let addr = index.wrapping_add(self.calc_param).wrapping_add(1);
-        let shift = addr % 31u32;
-        let rotated = if shift > 0 {
-            addr << shift | addr >> (32 - shift)
-        } else {
-            addr
+        let value = match self.kind {
+            PatternKind::Address => {
+                // wrapping like u32 arithmetic in the shader (no overflow panics in debug builds)
+                let addr = index.wrapping_add(self.calc_param).wrapping_add(1);
+                let shift = addr % 31u32;
+                if shift > 0 {
+                    addr << shift | addr >> (32 - shift)
+                } else {
+                    addr
+                }
+            }
+            PatternKind::WordToggle => 0u32.wrapping_sub(index & 1),
+            PatternKind::Checkerboard => 0x5555_5555 ^ 0u32.wrapping_sub(index & 1),
         };
-        rotated ^ self.xor_mask()
+        value ^ self.xor_mask()
     }
 }
 
-// IOBuf must have the same layout as the WGSL struct: 3*32 + 12 u32 fields + vec4
-const _: () = assert!(mem::size_of::<IOBuf>() == (3 * 32 + 12 + 4) * 4);
+// IOBuf must have the same layout as the WGSL struct: 3*32 + 16 u32 fields + vec4
+const _: () = assert!(mem::size_of::<IOBuf>() == (3 * 32 + 16 + 4) * 4);
 
 /// Why a window's wrong values look like writes that never reached memory
 #[derive(Debug, PartialEq)]
@@ -215,6 +273,7 @@ impl IOBuf {
     pub fn set_pattern(&mut self, pattern: Pattern) {
         self.calc_param = pattern.calc_param;
         self.xor_mask = pattern.xor_mask();
+        self.kind = pattern.kind as u32;
     }
     /// Sets what the window held before its last write, None if it wasn't rewritten
     pub fn set_previous_pattern(&mut self, previous: Option<Pattern>) {
@@ -222,9 +281,26 @@ impl IOBuf {
             None => self.stale_mode = 0,
             Some(previous) => {
                 self.prev_calc_param = previous.calc_param;
+                self.prev_kind = previous.kind as u32;
                 self.stale_mode = if previous.inverted { 2 } else { 1 };
             }
         }
+    }
+    pub fn set_order(&mut self, order: AccessOrder) {
+        self.order = order as u32;
+    }
+    /// The pattern kind and order of the pass, for error reports. None for the address
+    /// pattern in sequential order, the standard test's.
+    pub fn pattern_note(&self) -> Option<String> {
+        let kind = PatternKind::from_u32(self.kind).unwrap_or(PatternKind::Address);
+        let random = self.order == AccessOrder::Random as u32;
+        (kind != PatternKind::Address || random).then(|| {
+            format!(
+                "{} pattern{}",
+                kind.name(),
+                if random { ", random order" } else { "" }
+            )
+        })
     }
     /// Count of wrong 32-bit values found by the read pass
     pub fn wrong_words(&self) -> i64 {
@@ -262,6 +338,9 @@ impl IOBuf {
             prev_calc_param: self.prev_calc_param,
             stale_mode: self.stale_mode,
             xor_mask: self.xor_mask,
+            kind: self.kind,
+            prev_kind: self.prev_kind,
+            order: self.order,
             idx_max: u32::MIN,
             idx_min: u32::MAX,
             actual_max: u32::MIN,
@@ -288,13 +367,18 @@ impl IOBuf {
     /// Checks the expected value the shader reported for vec4 1 against the CPU calculation
     pub fn check_vec_first(&self) -> Result<(), Box<dyn std::error::Error>> {
         const TEST_IDX: u32 = 1;
+        let kind = PatternKind::from_u32(self.kind)
+            .ok_or_else(|| format!("unknown pattern kind {}", self.kind))?;
         let pattern = Pattern {
             calc_param: self.calc_param,
             inverted: self.xor_mask != 0,
+            kind,
         };
-        let expected = pattern.value(TEST_IDX * VEC_SIZE as u32);
-        if expected != self.first_elem.0[0] {
-            println!("{} 0x{:08X}", self, expected);
+        // all four values of the vec4, so the alternation of the toggling patterns is checked too
+        let expected: [u32; VEC_SIZE] =
+            std::array::from_fn(|i| pattern.value(TEST_IDX * VEC_SIZE as u32 + i as u32));
+        if expected != self.first_elem.0 {
+            println!("{} {:08X?}", self, expected);
             return Err("unexpected calculated value, maybe shader execution is broken".into());
         }
         Ok(())
@@ -498,15 +582,51 @@ mod tests {
     }
 
     #[test]
-    fn shader_value_check_accounts_for_inversion() {
-        for iteration in [1, 2] {
-            let pattern = Pattern::for_iteration(iteration, 1);
-            let mut buf = IOBuf::for_initial_iteration();
-            buf.set_pattern(pattern);
-            buf.first_elem.0[0] = pattern.value(4);
-            assert!(buf.check_vec_first().is_ok());
-            buf.first_elem.0[0] = !pattern.value(4);
-            assert!(buf.check_vec_first().is_err());
+    fn shader_value_check_accounts_for_inversion_and_kind() {
+        use PatternKind::*;
+        for kind in [Address, WordToggle, Checkerboard] {
+            for iteration in [1, 2] {
+                let pattern = Pattern::of_kind(kind, iteration, 1);
+                let mut buf = IOBuf::for_initial_iteration();
+                buf.set_pattern(pattern);
+                buf.first_elem.0 = std::array::from_fn(|i| pattern.value(4 + i as u32));
+                assert!(buf.check_vec_first().is_ok());
+                buf.first_elem.0[0] = !pattern.value(4);
+                assert!(buf.check_vec_first().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn toggling_patterns_flip_every_bit_between_neighbors_and_passes() {
+        use PatternKind::*;
+        let toggle = Pattern::of_kind(WordToggle, 3, 1);
+        assert_eq!(
+            (0..4).map(|i| toggle.value(i)).collect::<Vec<_>>(),
+            [0, 0xFFFF_FFFF, 0, 0xFFFF_FFFF]
+        );
+        let checkerboard = Pattern::of_kind(Checkerboard, 3, 1);
+        assert_eq!(
+            (0..2).map(|i| checkerboard.value(i)).collect::<Vec<_>>(),
+            [0x5555_5555, 0xAAAA_AAAA]
+        );
+        for kind in [WordToggle, Checkerboard] {
+            // the next iteration (inverted) and the next pair (plain) differ in every bit
+            // from what was written before, so a write that never landed is always seen
+            for iteration in [3, 4] {
+                let before = Pattern::of_kind(kind, iteration, 1);
+                let after = Pattern::of_kind(kind, iteration + 1, 1);
+                for index in [0, 1, 7, 0xFFFF_FFFF] {
+                    assert_eq!(after.value(index), !before.value(index));
+                }
+            }
+        }
+        // switching kinds still changes the values
+        for index in [0, 1] {
+            assert_ne!(
+                Pattern::of_kind(Checkerboard, 5, 1).value(index),
+                Pattern::of_kind(WordToggle, 4, 1).value(index)
+            );
         }
     }
 
