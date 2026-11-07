@@ -278,35 +278,42 @@ fn load_instance<Writer: std::io::Write>(
         .enabled_layer_names(&layers)
         .application_info(&app_info);
 
-    match unsafe { entry.create_instance(&instance_create_info, None) }
-        .err_as_str_context("instance with validation")
-    {
-        Ok(instance) => {
-            let mut severity = vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR;
-            if env.verbose() {
-                severity |= vk::DebugUtilsMessageSeverityFlagsEXT::INFO;
-                //lists all extensions, very verbose
-                //severity |= vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE;
-                let _ = writeln!(log_dupler, "DebugUtilsMessenger with seveity {severity:?}");
+    // The Khronos validation layer checks this program's Vulkan calls. It comes with the
+    // Vulkan SDK, so it's only there on developer machines, and it slows every call down:
+    // only used with diagnostic output (--verbose).
+    if env.verbose() {
+        match unsafe { entry.create_instance(&instance_create_info, None) }
+            .err_as_str_context("instance with validation")
+        {
+            Ok(instance) => {
+                // VERBOSE would list all extensions: too much
+                let severity = vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO;
+                let _ = writeln!(
+                    log_dupler,
+                    "Using the Vulkan validation layer, messages with severity {severity:?}"
+                );
+                let create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+                    .message_severity(severity)
+                    .message_type(
+                        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                            | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                            | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                    )
+                    .pfn_user_callback(Some(debug_callback));
+                let debug_utils = ash::ext::debug_utils::Instance::new(&entry, &instance);
+                let messenger =
+                    unsafe { debug_utils.create_debug_utils_messenger(&create_info, None) }
+                        .ok()
+                        .map(|messenger| (debug_utils, messenger));
+                return Ok((entry, instance, messenger));
             }
-            let create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
-                .message_severity(severity)
-                .message_type(
-                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-                )
-                .pfn_user_callback(Some(debug_callback));
-            let debug_utils = ash::ext::debug_utils::Instance::new(&entry, &instance);
-            let messenger = unsafe { debug_utils.create_debug_utils_messenger(&create_info, None) }
-                .ok()
-                .map(|messenger| (debug_utils, messenger));
-            return Ok((entry, instance, messenger));
-        }
-        Err(e) => {
-            if env.verbose() {
-                let _ = writeln!(log_dupler, "Not using validation layers due to {e}");
+            Err(e) => {
+                let _ = writeln!(
+                    log_dupler,
+                    "Not using the Vulkan validation layer (it comes with the Vulkan SDK): {e}"
+                );
             }
         }
     }
