@@ -28,6 +28,9 @@ use std::{
     time,
 };
 
+/// The original project this one is based on
+const UPSTREAM_URL: &str = "https://github.com/GpuZelenograd/memtest_vulkan";
+
 /// Exit codes of the console process, documented in --help
 mod exit_code {
     pub const PASSED: u32 = 0;
@@ -371,8 +374,9 @@ fn init_running_env() -> ProcessEnv {
         Ok(cli::Command::Run(options)) => options,
         Ok(cli::Command::Help) => {
             println!(
-                "memtest_vulkan v{} by GpuZelenograd, https://github.com/GpuZelenograd/memtest_vulkan\n",
-                env!("CARGO_PKG_VERSION")
+                "memtest_vulkan v{}  {}\nBased on memtest_vulkan by GpuZelenograd, {UPSTREAM_URL}\n",
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_REPOSITORY"),
             );
             print!("{}", cli::HELP);
             close::exit_process(exit_code::PASSED);
@@ -426,16 +430,15 @@ fn init_running_env() -> ProcessEnv {
         ..process_env
     };
     if process_env.interactive && !process_env.options.list {
-        print!("https://github.com/GpuZelenograd/");
-        let _ = std::io::stdout().flush();
         let mut color_setter = input::Reader::default();
         color_setter.set_pass_fail_accent_color(false);
-        println!(
-            "memtest_vulkan v{} by GpuZelenograd",
-            env!("CARGO_PKG_VERSION")
-        );
+        print!("memtest_vulkan v{}", env!("CARGO_PKG_VERSION"));
+        let _ = std::io::stdout().flush(); // the name in color, before the color is reset
         drop(color_setter);
-        println!("Press Ctrl+C to stop testing early. Options: memtest_vulkan --help");
+        println!("  {}", env!("CARGO_PKG_REPOSITORY"));
+        println!(
+            "Based on memtest_vulkan by GpuZelenograd. Press Ctrl+C to stop testing early, see --help for options."
+        );
     }
     process_env
 }

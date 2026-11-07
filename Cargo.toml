@@ -1,11 +1,13 @@
-#!/usr/bin/env -Scargo run --release --manifest-path
-#cargo fmt
-
 [package]
 edition = '2024'
 name = 'memtest_vulkan'
-version = '0.9.1-custom'
+# releases are tagged v<version>; the -duck suffix marks this fork's builds
+version = '0.10.0-duck'
 rust-version = "1.89"
+description = 'GPU video memory (VRAM) tester using Vulkan compute shaders'
+license = 'GPL-3.0-or-later'
+repository = 'https://github.com/SadCryingDuck/memtest_vulkan'
+readme = 'Readme.md'
 
 [dependencies]
 crossterm = { version = '0.29.0', default-features = false, features = ['events', 'windows'] }
