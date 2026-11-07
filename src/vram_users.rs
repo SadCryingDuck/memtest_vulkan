@@ -7,13 +7,17 @@
 pub fn dedicated_users(luid: [u8; 8]) -> Option<Vec<(String, u64)>> {
     let tag = luid_instance_tag(luid);
     let own_pid = std::process::id();
-    let usage: Vec<(u32, u64)> = unsafe { windows::dedicated_usage_by_pid() }?
+    let instances: Vec<(u32, u64)> = unsafe { windows::dedicated_usage_by_pid() }?
         .into_iter()
-        .filter_map(|(instance, bytes)| {
-            pid_of_instance(&instance, &tag)
-                .filter(|&pid| pid != own_pid && bytes > 0)
-                .map(|pid| (pid, bytes))
-        })
+        .filter_map(|(instance, bytes)| pid_of_instance(&instance, &tag).map(|pid| (pid, bytes)))
+        .collect();
+    // no counters for this GPU at all: unknown rather than unused, so the caller estimates
+    if instances.is_empty() {
+        return None;
+    }
+    let usage: Vec<(u32, u64)> = instances
+        .into_iter()
+        .filter(|&(pid, bytes)| pid != own_pid && bytes > 0)
         .collect();
     let names = unsafe { windows::process_names() };
     Some(group_by_name(usage.into_iter().map(|(pid, bytes)| {

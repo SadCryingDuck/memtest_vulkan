@@ -141,8 +141,12 @@ impl Schedule {
             TestMode::Standard => None,
             TestMode::Thorough => Some(format!(
                 "thorough test: address pattern, bus-toggling patterns, random access order \
-                 and pulsed load in turn, then a {}s hold",
-                self.hold().as_secs()
+                 and pulsed load in turn{}",
+                // tests under a minute are too short for the hold
+                match self.pause_at() {
+                    Some(_) => format!(", then a {}s hold", self.hold().as_secs()),
+                    None => String::new(),
+                }
             )),
             mode => Some(format!("{} test: {}", mode.arg(), mode.description())),
         }
@@ -233,6 +237,11 @@ mod tests {
         assert_eq!(short.hold(), Duration::from_secs(30));
         let long = Schedule::new(TestMode::Thorough, TestDuration::Limited(minutes(120)));
         assert_eq!(long.hold(), minutes(5));
+        // under a minute there's no hold, and the description doesn't promise one
+        let tiny = Schedule::new(TestMode::Thorough, TestDuration::Limited(minutes(1) / 2));
+        assert_eq!(tiny.pause_at(), None);
+        assert!(!tiny.description().unwrap().contains("hold"));
+        assert_eq!(tiny.phase_at(Duration::from_secs(29)), &PULSED);
     }
 
     #[test]
