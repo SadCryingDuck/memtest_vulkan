@@ -314,12 +314,23 @@ struct Candidate {
     size_limits: DeviceSizeLimits,
 }
 
-/// Queries one physical device; None if it can't run compute shaders
+/// Queries one physical device; None if it can't run the test
 unsafe fn query_candidate(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     index_in_device_iteration: usize,
 ) -> Option<Candidate> {
+    // The shaders are SPIR-V 1.3, which needs Vulkan 1.1. Older implementations (like early
+    // Raspberry Pi drivers) report 1.0 even though the application asked for 1.1.
+    let api_version =
+        unsafe { instance.get_physical_device_properties(physical_device) }.api_version;
+    if (
+        vk::api_version_major(api_version),
+        vk::api_version_minor(api_version),
+    ) < (1, 1)
+    {
+        return None;
+    }
     let queue_family_index =
         unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
             .into_iter()
@@ -342,43 +353,33 @@ unsafe fn query_candidate(
     // structure is only valid when the device exposes it as VK_KHR_maintenance4
     let has_maintenance4 = has_extension(ash::khr::maintenance4::NAME);
 
-    let mut properties = unsafe { instance.get_physical_device_properties(physical_device) };
-    let effective_version = (
-        vk::api_version_major(properties.api_version),
-        vk::api_version_minor(properties.api_version),
-    );
-
     let mut pci_bus_info = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
     let mut maintenance4 = vk::PhysicalDeviceMaintenance4Properties::default();
     let mut size_limits = DeviceSizeLimits::default();
 
-    //older vulkan implementations like broadcom on RaspberryPi lacks vk_1_1 support even if application requested it
-    let is_vk_1_1 = effective_version >= (1, 1);
-    let memory_props = if is_vk_1_1 {
-        {
-            // maxMemoryAllocationSize is Vulkan 1.1 core. The chained structures stay borrowed
-            // until device_props2 goes away at the end of this block.
-            let mut device_props2 =
-                vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance3);
-            if has_pci_bus_info {
-                device_props2 = device_props2.push_next(&mut pci_bus_info);
-            }
-            if has_maintenance4 {
-                device_props2 = device_props2.push_next(&mut maintenance4);
-            }
-            unsafe {
-                instance.get_physical_device_properties2(physical_device, &mut device_props2)
-            };
-            properties = device_props2.properties;
+    let properties = {
+        // maxMemoryAllocationSize is Vulkan 1.1 core. The chained structures stay borrowed
+        // until device_props2 goes away at the end of this block.
+        let mut device_props2 =
+            vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance3);
+        if has_pci_bus_info {
+            device_props2 = device_props2.push_next(&mut pci_bus_info);
         }
-        size_limits.max_memory_allocation_size =
-            Some(maintenance3.max_memory_allocation_size as i64).filter(|&size| size > 0);
         if has_maintenance4 {
-            size_limits.max_buffer_size =
-                Some(maintenance4.max_buffer_size as i64).filter(|&size| size > 0);
+            device_props2 = device_props2.push_next(&mut maintenance4);
         }
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut device_props2) };
+        device_props2.properties
+    };
+    size_limits.max_memory_allocation_size =
+        Some(maintenance3.max_memory_allocation_size as i64).filter(|&size| size > 0);
+    if has_maintenance4 {
+        size_limits.max_buffer_size =
+            Some(maintenance4.max_buffer_size as i64).filter(|&size| size > 0);
+    }
+    let memory_props = {
         let mut memory_props2 = vk::PhysicalDeviceMemoryProperties2::default();
         if has_memory_budget_ext {
             memory_props2 = memory_props2.push_next(&mut budget);
@@ -387,16 +388,13 @@ unsafe fn query_candidate(
             instance.get_physical_device_memory_properties2(physical_device, &mut memory_props2)
         };
         memory_props2.memory_properties
-    } else {
-        unsafe { instance.get_physical_device_memory_properties(physical_device) }
     };
 
     Some(Candidate {
         physical_device,
         queue_family_index,
         properties,
-        pci_bus: (has_pci_bus_info && is_vk_1_1)
-            .then_some((pci_bus_info.pci_bus, pci_bus_info.pci_device)),
+        pci_bus: has_pci_bus_info.then_some((pci_bus_info.pci_bus, pci_bus_info.pci_device)),
         memory_props,
         budget_props: MemoryBudget {
             heap_budget: budget.heap_budget,
