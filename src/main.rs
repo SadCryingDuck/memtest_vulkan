@@ -263,7 +263,7 @@ fn choose_settings<Writer: std::io::Write>(
     // more time to read the list and pick when there are several GPUs
     let countdown = time::Duration::from_secs(if choices.len() > 1 { 10 } else { 5 });
     let _ = log_dupler.flush();
-    match start_screen::show(&choices, defaults, countdown) {
+    match start_screen::show(&choices, defaults, countdown, env.options.duration_given) {
         start_screen::Outcome::Quit => {
             // a deliberate choice, not an error: no "press any key"
             let _ = writeln!(log_dupler, "Test cancelled, nothing was tested.");

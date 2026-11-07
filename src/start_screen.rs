@@ -511,14 +511,20 @@ fn read_key(timeout: Duration) -> std::io::Result<Option<Key>> {
 }
 
 /// Shows the screen. Without an interactive console, starts the test at once.
-pub fn show(devices: &[DeviceChoice], settings: Settings, countdown: Duration) -> Outcome {
+/// `duration_given`: the duration came from the command line, so changing the test keeps it
+pub fn show(
+    devices: &[DeviceChoice],
+    settings: Settings,
+    countdown: Duration,
+    duration_given: bool,
+) -> Outcome {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Outcome::Start(settings);
     }
     let Some(raw_mode) = RawMode::enable() else {
         return Outcome::Start(settings);
     };
-    let outcome = run(devices, settings.clone(), countdown);
+    let outcome = run(devices, settings.clone(), countdown, duration_given);
     drop(raw_mode);
     // if the keyboard can't be read, start the default test rather than quitting:
     // the user may have started it and walked away
@@ -533,6 +539,7 @@ fn run(
     devices: &[DeviceChoice],
     mut settings: Settings,
     countdown: Duration,
+    duration_given: bool,
 ) -> std::io::Result<Outcome> {
     let mut out = std::io::stdout();
     let several = devices.len() > 1;
@@ -609,7 +616,9 @@ fn run(
             }
             Some(Key::Char('s' | 'S') | Key::Up | Key::Down) => {
                 queue!(out, Print("\r\n"))?;
-                return settings_menu(&mut out, Menu::new(devices, settings));
+                let mut menu = Menu::new(devices, settings);
+                menu.duration_chosen = duration_given;
+                return settings_menu(&mut out, menu);
             }
             Some(Key::Char(_)) => {}
         }
@@ -818,6 +827,12 @@ mod tests {
         // digits don't start typing on the test row
         press(&mut menu, &[Key::Char('t'), Key::Char('3')]);
         assert!(menu.editing.is_none());
+        // a duration given on the command line stays too, even if it's the default
+        let mut menu = Menu::new(&devices, defaults());
+        menu.duration_chosen = true;
+        press(&mut menu, &[Key::Char('t')]);
+        assert_eq!(menu.settings.mode, TestMode::Thorough);
+        assert_eq!(menu.settings.duration, TestDuration::default());
     }
 
     #[test]

@@ -113,6 +113,8 @@ pub struct Options {
     /// Memory to test, in bytes
     pub size: Option<i64>,
     pub duration: TestDuration,
+    /// The duration was given, rather than the test's default
+    pub duration_given: bool,
     pub mode: TestMode,
     /// Maximum size of one test window, in megabytes
     pub window_mb: Option<i64>,
@@ -338,6 +340,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     if !duration_given {
         options.duration = options.mode.default_duration();
     }
+    options.duration_given = duration_given;
     Ok(Command::Run(options))
 }
 
@@ -356,6 +359,8 @@ mod tests {
     fn test_mode_sets_the_default_duration() {
         let thorough = run(&["--test", "thorough"]);
         assert_eq!(thorough.mode, TestMode::Thorough);
+        assert!(!thorough.duration_given);
+        assert!(run(&["-t", "5m"]).duration_given);
         assert_eq!(thorough.duration, TestDuration::Limited(THOROUGH_DURATION));
         // a given duration wins, wherever it is
         for args in [
