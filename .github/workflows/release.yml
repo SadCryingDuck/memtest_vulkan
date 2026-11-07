@@ -40,11 +40,17 @@ jobs:
     runs-on: ubuntu-26.04
     permissions:
       contents: write
+      # signed build provenance: proof of which workflow run and commit built each file
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+      - uses: actions/attest@v4
+        with:
+          subject-path: dist/memtest_vulkan-*
       - uses: actions/checkout@v7
         with:
           path: source

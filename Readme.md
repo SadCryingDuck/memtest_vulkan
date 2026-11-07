@@ -13,6 +13,8 @@ Requires system-provided vulkan loader and driver supporting Vulkan 1.1 (already
 ### [**<kbd>📥</kbd>** Get .exe from latest release](https://github.com/SadCryingDuck/memtest_vulkan/releases/latest)
 GitHub users also may want to try [CI build artifacts](https://github.com/SadCryingDuck/memtest_vulkan/actions) (only last 3 months kept).
 
+Release files are built by GitHub Actions and come with a signed build record. To check that a download was built by this repository from its published source, use the [GitHub CLI](https://cli.github.com): `gh attestation verify memtest_vulkan-v0.12.0-duck-windows-x86_64.exe -R SadCryingDuck/memtest_vulkan`
+
 Start test by double-clicking the utility, no installation / parameters / configuration / admin-rights required. The test starts by itself after a short countdown. Before that, you can type the number of the GPU to test, or press S (or an arrow key) to open the settings: the GPU, the duration (from a 1-minute check to an endless test), the amount of memory, and stopping the test at the first error, which is handy when tuning an overclock. Up/Down choose a setting and Left/Right change it, or type a number for a custom value: minutes for the duration, GB for the memory. G, D, M and E are shortcuts for the four settings. Enter starts the test, Esc quits.
 
 While testing, a progress line shows the time, a progress bar, the speed and the errors found so far. At the first error the console beeps and its taskbar button flashes, so errors get noticed even in a minimized window. The summary at the end says what to do next.
@@ -319,11 +321,13 @@ Releases are built and published by GitHub Actions (`.github/workflows/release.y
 1. set the new version in `Cargo.toml`, keeping the `-duck` suffix that marks this fork's builds, like `version = '0.10.1-duck'`, and commit it
 2. tag that commit with the same version and push the tag: `git tag v0.10.1-duck` and `git push origin v0.10.1-duck`
 
-The workflow checks that the tag matches the version, runs the checks and tests, builds Windows x86_64, Linux x86_64 and Linux aarch64 in parallel and publishes a release with these files and their SHA-256 checksums:
+The workflow checks that the tag matches the version, runs the checks and tests, builds Windows x86_64, Linux x86_64 and Linux aarch64 in parallel and publishes a release with these files, their SHA-256 checksums and the license texts:
  - `memtest_vulkan-v0.10.1-duck-windows-x86_64.exe`
  - `memtest_vulkan-v0.10.1-duck-linux-x86_64.tar.xz`
  - `memtest_vulkan-v0.10.1-duck-linux-aarch64.tar.xz`
- - `SHA256SUMS.txt`
+ - `SHA256SUMS.txt`, `LICENSE.txt`, `LICENSE-zlib-original.txt`
+
+It also signs a [build provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) for each binary, which records the workflow run and commit that built it. They're listed on the repository's [attestations page](https://github.com/SadCryingDuck/memtest_vulkan/attestations).
 
 The Windows 7 builds of the original project need a special nightly toolchain and aren't made by this fork.
 
