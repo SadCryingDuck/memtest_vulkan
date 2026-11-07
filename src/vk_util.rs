@@ -1,6 +1,6 @@
 //! Vulkan helpers: loading Vulkan, error conversion and validation-layer plumbing.
 
-use crate::{ProcessEnv, close, display_this_process_result};
+use crate::{ProcessEnv, display_this_process_result};
 
 use ash::vk;
 use std::{
@@ -54,13 +54,32 @@ pub trait MapErrStr {
     }
 }
 
+/// Converts Vulkan errors like `MapErrStr`, marking running out of memory as `OutOfMemory`:
+/// while allocating, that's the one error worth retrying with less memory
 pub trait MapErrRetryWithLowerMemory {
     type ValueType;
     fn err_retry_with_lower_memory(
         self,
-        env: &ProcessEnv,
         context: &str,
     ) -> Result<Self::ValueType, Box<dyn std::error::Error>>;
+}
+
+/// The driver ran out of memory. Other errors, like ERROR_DEVICE_LOST or a GPU hang, can be
+/// signs of unstable memory, so they end the test instead of being retried with less memory,
+/// which could end in a PASSED result for memory that failed.
+#[derive(Debug)]
+pub struct OutOfMemory(String);
+
+impl fmt::Display for OutOfMemory {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OutOfMemory {}
+
+pub fn is_out_of_memory(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.is::<OutOfMemory>()
 }
 
 fn describe<T>(result: vk::Result, context: Option<&str>) -> String {
@@ -97,28 +116,18 @@ impl<T> MapErrRetryWithLowerMemory for Result<T, vk::Result> {
     type ValueType = T;
     fn err_retry_with_lower_memory(
         self,
-        env: &ProcessEnv,
         context: &str,
     ) -> Result<Self::ValueType, Box<dyn std::error::Error>> {
         self.map_err(|result| {
-            let msg = describe::<T>(result, Some(context));
-            if !env.interactive
-                && !close::check_any_bits_set(close::fetch_status(), close::app_status::INITED_OK)
-            {
-                let out_of_memory = matches!(
-                    result,
-                    vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY
-                );
-                // Running out of memory is expected while searching for the testable size.
-                // Other errors (like ERROR_DEVICE_LOST after a GPU hang/driver reset) may indicate
-                // instability, so always show them instead of retrying silently.
-                if env.verbose() || !out_of_memory {
-                    println!("Retrying with lower memory due to {}", msg);
-                }
-                //immediate exit in non-interactive during init to initiate try with lower memory
-                close::immediate_exit(true);
+            let message = describe::<T>(result, Some(context));
+            if matches!(
+                result,
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+            ) {
+                Box::new(OutOfMemory(message)) as Box<dyn std::error::Error>
+            } else {
+                message.into()
             }
-            msg.into()
         })
     }
 }
@@ -148,6 +157,28 @@ mod tests {
             ),
             "ERROR_OUT_OF_DEVICE_MEMORY (A device memory allocation has failed) \
              while getting ash::vk::definitions::Buffer in context create_buffer"
+        );
+    }
+
+    #[test]
+    fn only_running_out_of_memory_is_retried() {
+        let error = |result| {
+            Err::<(), _>(result)
+                .err_retry_with_lower_memory("allocate_memory")
+                .unwrap_err()
+        };
+        assert!(is_out_of_memory(
+            error(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY).as_ref()
+        ));
+        assert!(is_out_of_memory(
+            error(vk::Result::ERROR_OUT_OF_HOST_MEMORY).as_ref()
+        ));
+        // a lost device can come from unstable memory: never retried with less memory
+        let lost = error(vk::Result::ERROR_DEVICE_LOST);
+        assert!(!is_out_of_memory(lost.as_ref()));
+        assert!(
+            lost.to_string().starts_with("ERROR_DEVICE_LOST ("),
+            "{lost}"
         );
     }
 

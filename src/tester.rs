@@ -9,18 +9,19 @@ use crate::{
     iobuf::{ErrorTotals, IOBuf, Pattern},
     output, ram,
     shader::{
-        ALLOCATION_TRY_STEP, ELEMENT_SIZE, EMULATE_ALLOCATION_LIMIT_ENV, EMULATE_SKIPPED_WRITE_ENV,
-        GB, MAP_FOR_GETTING_ADDRESS_SIZE, MAX_WINDOW_MB_ENV, MIN_WANTED_ALLOCATION, READ_SHADER,
-        TEST_WINDOW_1D_MAX_GROUPS, TEST_WINDOW_MAX_SIZE, TEST_WINDOW_SIZE_GRANULARITY, VEC_SIZE,
-        WG_SIZE, WRITE_MARKER,
+        ALLOCATION_TRY_STEP, ELEMENT_SIZE, EMULATE_ALLOCATION_LIMIT_ENV, EMULATE_FAILURE_ENV,
+        EMULATE_SKIPPED_WRITE_ENV, GB, MAP_FOR_GETTING_ADDRESS_SIZE, MAX_WINDOW_MB_ENV,
+        MIN_WANTED_ALLOCATION, READ_SHADER, TEST_WINDOW_1D_MAX_GROUPS, TEST_WINDOW_MAX_SIZE,
+        TEST_WINDOW_SIZE_GRANULARITY, VEC_SIZE, WG_SIZE, WRITE_MARKER,
     },
     text,
-    vk_util::{MapErrRetryWithLowerMemory, MapErrStr},
+    vk_util::{self, MapErrRetryWithLowerMemory, MapErrStr},
 };
 
 use ash::vk;
 use core::cmp::{max, min};
 use std::{
+    cell::Cell,
     env,
     error::Error,
     io::{IsTerminal, Write},
@@ -98,6 +99,37 @@ impl ReadMode {
     }
 }
 
+/// A failure emulated in a GPU pass, to check how failures are reported
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EmulatedFailure {
+    DeviceLost,
+    Hang,
+    Panic,
+}
+
+/// Parses the EMULATE_FAILURE_ENV value: the failure and the 1-based pass it happens in
+fn parse_emulated_failure(text: &str) -> Option<(EmulatedFailure, u32)> {
+    let (kind, pass) = match text.trim().split_once(':') {
+        Some((kind, pass)) => (kind, pass.trim().parse().ok().filter(|&pass| pass > 0)?),
+        None => (text.trim(), 1),
+    };
+    let failure = match kind.trim() {
+        "device-lost" => EmulatedFailure::DeviceLost,
+        "hang" => EmulatedFailure::Hang,
+        "panic" => EmulatedFailure::Panic,
+        _ => return None,
+    };
+    Some((failure, pass))
+}
+
+fn hang_error() -> Box<dyn Error> {
+    format!(
+        "the GPU didn't finish a test pass within {} seconds, it seems to have hung",
+        PASS_HANG_TIMEOUT.as_secs()
+    )
+    .into()
+}
+
 /// GPU objects used to run the test passes
 struct Tester<'a> {
     device: &'a ash::Device,
@@ -114,10 +146,22 @@ struct Tester<'a> {
     test_mem_index: u32,
     windows: Vec<TestWindow>,
     window_size: i64,
+    /// A pass didn't finish: the GPU may still be using the memory, and waiting for it may
+    /// never end
+    gpu_hung: Cell<bool>,
+    /// GPU passes run so far
+    passes: Cell<u32>,
+    emulated_failure: Option<(EmulatedFailure, u32)>,
 }
 
 impl Drop for Tester<'_> {
     fn drop(&mut self) {
+        if self.gpu_hung.get() {
+            // device_wait_idle has no timeout and would block forever on a hung GPU, which hides
+            // the hang message; freeing memory the GPU still uses is invalid. The process is
+            // about to exit, which frees everything anyway.
+            return;
+        }
         unsafe {
             let _ = self.device.device_wait_idle();
             self.free_windows();
@@ -256,6 +300,11 @@ impl<'a> Tester<'a> {
             test_mem_index,
             windows: Vec::new(),
             window_size: 0,
+            gpu_hung: Cell::new(false),
+            passes: Cell::new(0),
+            emulated_failure: env::var(EMULATE_FAILURE_ENV)
+                .ok()
+                .and_then(|text| parse_emulated_failure(&text)),
         })
     }
 
@@ -303,7 +352,7 @@ impl<'a> Tester<'a> {
             && total > limit
         {
             Err::<(), _>(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
-                .err_retry_with_lower_memory(self.env, "allocate_memory (emulated limit)")?;
+                .err_retry_with_lower_memory("allocate_memory (emulated limit)")?;
         }
         let count = max(
             2,
@@ -319,13 +368,13 @@ impl<'a> Tester<'a> {
                 self.device
                     .create_buffer(&test_buffer_create_info(self.window_size), None)
             }
-            .err_retry_with_lower_memory(self.env, "create_buffer")?;
+            .err_retry_with_lower_memory("create_buffer")?;
             let buffer_reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
             let allocate_info = vk::MemoryAllocateInfo::default()
                 .allocation_size(buffer_reqs.size)
                 .memory_type_index(self.test_mem_index);
             let memory = match unsafe { self.device.allocate_memory(&allocate_info, None) }
-                .err_retry_with_lower_memory(self.env, "allocate_memory")
+                .err_retry_with_lower_memory("allocate_memory")
             {
                 Ok(memory) => memory,
                 Err(e) => {
@@ -339,7 +388,7 @@ impl<'a> Tester<'a> {
                 active: true,
             });
             unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }
-                .err_retry_with_lower_memory(self.env, "bind_buffer_memory")?;
+                .err_retry_with_lower_memory("bind_buffer_memory")?;
         }
         Ok(())
     }
@@ -361,11 +410,26 @@ impl<'a> Tester<'a> {
         fill_marker: bool,
         pipeline: Option<vk::Pipeline>,
     ) -> BoxResult<Duration> {
-        let env = self.env;
         let device = self.device;
         let buffer = self.windows[window_idx].buffer;
         let test_element_count = (self.window_size / ELEMENT_SIZE) as u32;
         let start = Instant::now();
+        let pass = self.passes.get() + 1;
+        self.passes.set(pass);
+        match self.emulated_failure {
+            Some((EmulatedFailure::DeviceLost, at)) if at == pass => {
+                Err::<(), _>(vk::Result::ERROR_DEVICE_LOST)
+                    .err_retry_with_lower_memory("queue_submit (emulated)")?;
+            }
+            Some((EmulatedFailure::Hang, at)) if at == pass => {
+                self.gpu_hung.set(true);
+                return Err(hang_error());
+            }
+            Some((EmulatedFailure::Panic, at)) if at == pass => {
+                panic!("emulated panic in GPU pass {pass}");
+            }
+            _ => {}
+        }
         unsafe {
             device.update_descriptor_sets(
                 &[vk::WriteDescriptorSet::default()
@@ -381,7 +445,7 @@ impl<'a> Tester<'a> {
             let cmd_buf = self.cmd_buf;
             device
                 .begin_command_buffer(cmd_buf, &vk::CommandBufferBeginInfo::default())
-                .err_retry_with_lower_memory(env, "begin_command_buffer")?;
+                .err_retry_with_lower_memory("begin_command_buffer")?;
             if fill_marker {
                 device.cmd_fill_buffer(cmd_buf, buffer, 0, vk::WHOLE_SIZE, WRITE_MARKER);
                 // the fill must complete before the shader writes/reads the window
@@ -432,12 +496,12 @@ impl<'a> Tester<'a> {
             );
             device
                 .end_command_buffer(cmd_buf)
-                .err_retry_with_lower_memory(env, "end_command_buffer")?;
+                .err_retry_with_lower_memory("end_command_buffer")?;
             let cmd_bufs = [cmd_buf];
             let submit_info = &[vk::SubmitInfo::default().command_buffers(&cmd_bufs)];
             device
                 .queue_submit(self.queue, submit_info, self.fence)
-                .err_retry_with_lower_memory(env, "queue_submit")?;
+                .err_retry_with_lower_memory("queue_submit")?;
             // wait in slices, so a GPU hang gets reported instead of waiting forever
             loop {
                 // ash reports a wait that timed out as Err(TIMEOUT): that's not a failure,
@@ -445,21 +509,18 @@ impl<'a> Tester<'a> {
                 match device.wait_for_fences(&[self.fence], true, FENCE_WAIT_SLICE_NS) {
                     Err(vk::Result::TIMEOUT) => {}
                     waited => {
-                        waited.err_retry_with_lower_memory(env, "wait_for_fences")?;
+                        waited.err_retry_with_lower_memory("wait_for_fences")?;
                         break;
                     }
                 }
                 if start.elapsed() > PASS_HANG_TIMEOUT {
-                    return Err(format!(
-                        "the GPU didn't finish a test pass within {} seconds, it seems to have hung",
-                        PASS_HANG_TIMEOUT.as_secs()
-                    )
-                    .into());
+                    self.gpu_hung.set(true);
+                    return Err(hang_error());
                 }
             }
             device
                 .reset_fences(&[self.fence])
-                .err_retry_with_lower_memory(env, "reset_fences")?;
+                .err_retry_with_lower_memory("reset_fences")?;
         }
         Ok(start.elapsed())
     }
@@ -502,6 +563,17 @@ impl<'a> Tester<'a> {
         else {
             return Ok(false);
         };
+        if total_errors == 0 {
+            // The shader flagged an error but counted no wrong values: the test's own results
+            // (in GPU memory too) can't be trusted, so the test can't go on
+            writeln!(log_dupler, "{io_out}")?;
+            return Err(format!(
+                "the GPU flagged an error in window {} but reported no wrong values, so the \
+                 test's own results seem corrupted",
+                window_idx + 1
+            )
+            .into());
+        }
         let unwritten = totals.add(io_out);
         let unwritten_words = unwritten.as_ref().map_or(0, |evidence| evidence.words());
         if unwritten.is_some() {
@@ -834,6 +906,16 @@ fn test_device<Writer: std::io::Write>(
             Ok(()) => break,
             Err(e) => last_err = e,
         }
+        // Only running out of memory is retried with less memory. Other errors, like a lost
+        // device or a hang, can come from unstable memory: retrying them could end in PASSED.
+        // Memory errors found by the fill so far must be reported, so they end the test too.
+        let errors_found = close::check_any_bits_set(
+            close::fetch_status(),
+            close::app_status::RUNTIME_ERRORS | close::app_status::WRITES_NOT_APPLIED,
+        );
+        if !vk_util::is_out_of_memory(last_err.as_ref()) || errors_found {
+            return Err(last_err);
+        }
         if env.verbose() {
             let _ = writeln!(
                 log_dupler,
@@ -843,7 +925,7 @@ fn test_device<Writer: std::io::Write>(
             );
         }
         if !env.interactive {
-            close::immediate_exit(true);
+            close::exit_to_retry_with_less_memory();
         }
         allocation_size -= ALLOCATION_TRY_STEP;
         // only announce a retry if there's still a size worth trying
@@ -957,16 +1039,13 @@ fn initial_fill<Writer: std::io::Write>(
         )?;
         let (io_out, _) = tester.read_window(window_idx, initial)?;
         // memory errors found by the initial fill are real errors too
-        if tester
-            .report_errors(
-                log_dupler,
-                totals,
-                &io_out,
-                window_idx,
-                ReadMode::InitialRead,
-            )
-            .unwrap_or(true)
-        {
+        if tester.report_errors(
+            log_dupler,
+            totals,
+            &io_out,
+            window_idx,
+            ReadMode::InitialRead,
+        )? {
             *last_error_at = Some(Duration::ZERO);
         }
     }
@@ -1215,7 +1294,8 @@ fn main_loop<Writer: std::io::Write>(
                 while pause_start.elapsed() < LOAD_PAUSE {
                     log_dupler.show_live_line(&format!(
                         "  Pausing the GPU load: {}s left",
-                        (LOAD_PAUSE - pause_start.elapsed()).as_secs() + 1
+                        // saturating: the pause may end between the loop check and here
+                        LOAD_PAUSE.saturating_sub(pause_start.elapsed()).as_secs() + 1
                     ));
                     std::thread::sleep(Duration::from_millis(250));
                     if close::close_requested() {
@@ -1502,6 +1582,20 @@ mod tests {
 
     fn ms(values: &[u64]) -> Vec<Duration> {
         values.iter().map(|&v| Duration::from_millis(v)).collect()
+    }
+
+    #[test]
+    fn emulated_failures_parse() {
+        use EmulatedFailure::*;
+        assert_eq!(parse_emulated_failure("hang"), Some((Hang, 1)));
+        assert_eq!(
+            parse_emulated_failure(" device-lost:20 "),
+            Some((DeviceLost, 20))
+        );
+        assert_eq!(parse_emulated_failure("panic:3"), Some((Panic, 3)));
+        assert_eq!(parse_emulated_failure("hang:0"), None);
+        assert_eq!(parse_emulated_failure("hang:x"), None);
+        assert_eq!(parse_emulated_failure("crash"), None);
     }
 
     #[test]

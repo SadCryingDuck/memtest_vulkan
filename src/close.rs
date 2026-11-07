@@ -16,6 +16,10 @@ pub mod app_status {
     pub const COMPLETED: u8 = 0b00_1000; //the requested test duration was completed
     pub const QUIT_JOB_REQUESTED: u8 = 0b01_0000; //console closing or termination: quit all jobs at once
     pub const WRITES_NOT_APPLIED: u8 = 0b10_0000; //test writes never reached memory: results invalid
+
+    /// Not status bits: the worker's request to run again with less memory, after the driver
+    /// ran out of memory while allocating. Both signature bits set never occur in a status.
+    pub const RETRY_WITH_LESS_MEMORY: u8 = 0b1100_0100;
 }
 
 /// What Ctrl+C does
@@ -50,6 +54,11 @@ pub fn close_requested() -> bool {
         return true;
     }
     INTERRUPT_REQUESTED.swap(false, SeqCst)
+}
+
+/// Asks the console process to run the test again with less memory (the worker process protocol)
+pub fn exit_to_retry_with_less_memory() -> ! {
+    exit_process(app_status::RETRY_WITH_LESS_MEMORY as u32);
 }
 
 /// Exits with the status bits as the exit code (the worker process protocol)

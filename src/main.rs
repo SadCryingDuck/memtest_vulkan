@@ -1,8 +1,8 @@
 //! memtest_vulkan: tests GPU video memory with Vulkan compute shaders.
 //!
 //! The console process lists the devices and lets the user pick one, then runs the test in a
-//! worker process (the same executable started with --worker). If the driver fails while
-//! allocating, the worker exits and the console retries with less memory.
+//! worker process (the same executable started with --worker). If the driver runs out of
+//! memory while allocating, the worker exits and the console retries with less memory.
 
 mod alert;
 mod cli;
@@ -147,16 +147,28 @@ fn run_worker<Writer: std::io::Write>(
     let code = exit_status
         .code()
         .ok_or("The test process was terminated without an exit code")?;
-    let status = code as u8;
-    if (status & close::app_status::SIGNATURE_MASK) != close::app_status::SIGNATURE {
-        return Err(format!("The test process failed with exit code {code}").into());
+    // Windows crash codes (like 0xC0000005) don't fit in a byte and mustn't be truncated to one
+    let crashed = || format!("The test process failed with exit code {code}");
+    let status = u8::try_from(code).map_err(|_| crashed())?;
+    if status == close::app_status::RETRY_WITH_LESS_MEMORY {
+        // Ctrl+C while the worker was allocating stops the retries too
+        return Ok(Some(if parent_close_requested {
+            close::app_status::SIGNATURE
+        } else {
+            status
+        }));
     }
+    if (status & close::app_status::SIGNATURE_MASK) != close::app_status::SIGNATURE {
+        return Err(crashed().into());
+    }
+    // a runtime error the worker already showed (like a lost device) also ends it as expected
     let expected_end = parent_close_requested
         || close::check_any_bits_set(
             status,
-            close::app_status::QUIT_JOB_REQUESTED | close::app_status::COMPLETED,
-        )
-        || status == (close::app_status::SIGNATURE | close::app_status::RUNTIME_ABORT);
+            close::app_status::QUIT_JOB_REQUESTED
+                | close::app_status::COMPLETED
+                | close::app_status::RUNTIME_ABORT,
+        );
     if !expected_end {
         let _ = writeln!(
             log_dupler,
@@ -187,11 +199,8 @@ fn test_selected_device<Writer: std::io::Write>(
                     let _ = writeln!(log_dupler, "Couldn't start the test process!");
                     break;
                 }
-                // the worker exits like this when the driver fails during allocation
-                Some(status)
-                    if status
-                        == (close::app_status::SIGNATURE | close::app_status::RUNTIME_ABORT) =>
-                {
+                // the driver ran out of memory while the worker was allocating
+                Some(close::app_status::RETRY_WITH_LESS_MEMORY) => {
                     let tried_bytes = env.max_test_bytes();
                     let smaller_memory = tried_bytes - ALLOCATION_TRY_STEP;
                     if smaller_memory < MIN_WANTED_ALLOCATION {
@@ -273,12 +282,15 @@ fn select_device_and_test<Writer: std::io::Write>(
     log_dupler: &mut output::LogDupler<Writer>,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     if env.interactive {
-        let _ = writeln!(log_dupler);
+        // separates the list from the banner, which --list leaves out
+        if !env.options.list {
+            let _ = writeln!(log_dupler);
+        }
         for (i, desc) in loaded_devices.devices.iter().enumerate() {
             let _ = writeln!(log_dupler, "{}: {}", i + 1, desc.label);
         }
         if loaded_devices.devices.is_empty() {
-            return Err("No GPU able to run Vulkan compute shaders was found. Check that the GPU driver is installed.".into());
+            return Err("No GPU supporting Vulkan 1.1 compute shaders was found. Check that the GPU driver is installed and up to date.".into());
         }
         if env.options.list {
             let _ = log_dupler.flush();
@@ -550,8 +562,24 @@ fn display_result<Writer: std::io::Write>(
     }
 }
 
+/// A panic would exit with Rust's code 101, which the console would decode as worker status
+/// bits (101 reads as "writes not applied"). Exit as a runtime error instead.
+fn report_panics_as_runtime_errors(worker: bool) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let _ = std::io::stdout().flush();
+        if worker {
+            // keeps the status bits raised so far, like memory errors already found
+            close::immediate_exit(true)
+        }
+        close::exit_process(exit_code::NOT_RUN)
+    }));
+}
+
 fn main() {
     let mut env = init_running_env();
+    report_panics_as_runtime_errors(!env.interactive);
     if !env.interactive {
         // first Ctrl+C finishes the current pass and prints the summary, the second one quits at once
         close::setup_handler(close::HandlerMode::GracefulThenImmediate);
