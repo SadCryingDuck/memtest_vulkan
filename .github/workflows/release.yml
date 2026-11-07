@@ -28,6 +28,16 @@ jobs:
             *-duck) ;;
             *) echo "::error::Version $version must end with -duck"; exit 1 ;;
           esac
+      - name: CHANGELOG.md must have notes for the tag
+        shell: bash
+        run: |
+          # the section from "## <tag>" to the next "## " heading
+          notes=$(awk -v heading="## $GITHUB_REF_NAME" \
+            '$0 == heading {found = 1; next} found && /^## / {exit} found {print}' CHANGELOG.md)
+          if [ -z "$(echo "$notes" | tr -d '[:space:]')" ]; then
+            echo "::error::CHANGELOG.md has no section '## $GITHUB_REF_NAME' with release notes"
+            exit 1
+          fi
 
   ci:
     needs: check-tag
@@ -61,12 +71,19 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: sha256sum * | tee SHA256SUMS.txt
+      - name: Release notes from CHANGELOG.md
+        run: |
+          awk -v heading="## $GITHUB_REF_NAME" \
+            '$0 == heading {found = 1; next} found && /^## / {exit} found {print}' \
+            source/CHANGELOG.md | tee notes.md
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+        # the changelog section first, then GitHub's list of changes
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --verify-tag \
             --title "memtest_vulkan $GITHUB_REF_NAME" \
+            --notes-file notes.md \
             --generate-notes

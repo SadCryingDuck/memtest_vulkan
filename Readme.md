@@ -335,10 +335,10 @@ If you want to experiment with code modifications, there are two ways to do this
 ### Releases
 
 Releases are built and published by GitHub Actions (`.github/workflows/release.yml`) when a version tag is pushed:
-1. set the new version in `Cargo.toml`, keeping the `-duck` suffix that marks this fork's builds, like `version = '0.10.1-duck'`, and commit it
+1. set the new version in `Cargo.toml`, keeping the `-duck` suffix that marks this fork's builds, like `version = '0.10.1-duck'`, add a `## v0.10.1-duck` section with the release notes to [CHANGELOG.md](CHANGELOG.md), and commit both
 2. tag that commit with the same version and push the tag: `git tag v0.10.1-duck` and `git push origin v0.10.1-duck`
 
-The workflow checks that the tag matches the version, runs the checks and tests, builds Windows x86_64, Linux x86_64 and Linux aarch64 in parallel and publishes a release with these files, their SHA-256 checksums and the license texts:
+The workflow checks that the tag matches the version and has notes in the changelog, runs the checks and tests, builds Windows x86_64, Linux x86_64 and Linux aarch64 in parallel and publishes a release with these files, their SHA-256 checksums and the license texts:
  - `memtest_vulkan-v0.10.1-duck-windows-x86_64.exe`
  - `memtest_vulkan-v0.10.1-duck-linux-x86_64.tar.xz`
  - `memtest_vulkan-v0.10.1-duck-linux-aarch64.tar.xz`
