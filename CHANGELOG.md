@@ -17,6 +17,9 @@ Changes in SadCryingDuck's fork of memtest_vulkan. Each release's notes on GitHu
 - The test memory is split into windows of 512MB to 1GB instead of up to 3.9GB. When the driver places part of the test in system RAM because other programs use the VRAM, only that window is dropped. Before, a big window could stay in the test, so part of the run checked system RAM instead of VRAM.
 - Before testing a discrete GPU, the test shows how much of its memory other programs use, since that part can't be tested, and names the biggest users on Windows. With a second GPU, it suggests connecting the monitor to that one while testing, which frees the memory the desktop uses.
 
+### Fixes
+- Data lost during the load pause near the end of the test is reported as memory errors. Before, a big block of it could be reported as writes that never reached the memory (results invalid).
+
 ## v0.12.0-duck
 
 - Only running out of memory is retried with less memory. A lost GPU, a hang or a crash now ends the test as a runtime error, where before the test could retry with less memory until a smaller size passed.
