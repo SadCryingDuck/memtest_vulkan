@@ -296,8 +296,8 @@ fn select_device_and_test<Writer: std::io::Write>(
 ) -> Result<u8, Box<dyn std::error::Error>> {
     if env.interactive {
         let _ = writeln!(log_dupler);
-        for desc in loaded_devices.devices.iter() {
-            let _ = writeln!(log_dupler, "{}", desc.label);
+        for (i, desc) in loaded_devices.devices.iter().enumerate() {
+            let _ = writeln!(log_dupler, "{}: {}", i + 1, desc.label);
         }
         if loaded_devices.devices.is_empty() {
             return Err("No GPU able to run Vulkan compute shaders was found. Check that the GPU driver is installed.".into());

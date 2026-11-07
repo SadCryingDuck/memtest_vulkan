@@ -53,7 +53,7 @@ pub struct DeviceSizeLimits {
 }
 
 pub struct NamedComputeDevice {
-    /// Number, name, memory size and type as shown in the list
+    /// Name, memory size and type, shown in the list after the GPU number
     pub label: String,
     pub physical_device: vk::PhysicalDevice,
     pub queue_family_index: u32,
@@ -429,7 +429,7 @@ pub fn list_devices_ordered_labeled_from_1<Writer: std::io::Write>(
         )
     });
     let mut devices: Vec<NamedComputeDevice> = Vec::new();
-    for (i, candidate) in candidates.into_iter().enumerate() {
+    for candidate in candidates {
         let props = candidate.properties;
         let mut total_memory = 0i64;
         for heap in &candidate.memory_props.memory_heaps
@@ -468,8 +468,7 @@ pub fn list_devices_ordered_labeled_from_1<Writer: std::io::Write>(
             );
         }
         device.label = format!(
-            "{}: {name}  {}GB {}  ({details})",
-            i + 1,
+            "{name}  {}GB {}  ({details})",
             (total_memory as f32 / GB).ceil(),
             device.device_type_name(),
         );
