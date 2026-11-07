@@ -1,0 +1,81 @@
+name: Bug report
+description: Something went wrong, or a result looks wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! The details below make it possible to tell a problem in memtest_vulkan from a problem with the GPU, its memory or its driver. NVIDIA cards and Linux haven't been tested much yet, so reports from them are especially welcome.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Include the Result line and any error messages.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: memtest_vulkan version
+      description: The first line it prints, or the output of `memtest_vulkan --version`
+      placeholder: memtest_vulkan v0.13.0-duck
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      description: The GPU line memtest_vulkan prints, and the driver version
+      placeholder: Intel(R) Arc(TM) B580 Graphics 12GB, driver 32.0.101.6979
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux (please name the distribution below)
+        - Other (please name it below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tuning
+    attributes:
+      label: GPU tuning
+      description: Overclocking or undervolting changes how memory errors should be read
+      options:
+        - Stock settings
+        - Memory overclocked
+        - Core overclocked
+        - Undervolted
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: how-run
+    attributes:
+      label: How you ran it
+      description: The settings on the start screen, or the command line
+      placeholder: "Double-clicked, thorough test, 15:00 / memtest_vulkan --test bus -t 30m"
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: |
+        The contents of `memtest_vulkan.log` from the folder memtest_vulkan ran in (or drag the file here). If the problem is about starting or detecting the GPU, a run with diagnostic output (V in the start screen's settings, or `--verbose`) helps most.
+      render: text
+
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
+      description: Like whether it also happens with the standard test, with a smaller test window size (W in the settings, or `--window-mb 256`), or at stock settings.
