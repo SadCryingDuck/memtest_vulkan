@@ -130,8 +130,40 @@ fn write_index(effective_invocation_id: u32) -> u32
     return effective_invocation_id + GRANULE_VEC4S - 2 * proccessed_mod - 1;
 }
 
+// Error statistics of one workgroup. Errors are counted here first, in fast workgroup memory,
+// then added to the IO buffer once per workgroup. Counting every wrong value directly in the
+// IO buffer made a read pass with all values wrong (a write that never landed) take seconds,
+// with hundreds of millions of atomics on the same few counters: long enough for the GPU
+// driver to be reset.
+var<workgroup> wg_errors: atomic<u32>;
+var<workgroup> wg_err_bit1_idx: array<atomic<u32>, 32>;
+var<workgroup> wg_err_bitcount: array<atomic<u32>, 32>;
+var<workgroup> wg_mem_bitcount: array<atomic<u32>, 32>;
+var<workgroup> wg_actual_ff: atomic<u32>;
+var<workgroup> wg_actual_max: atomic<u32>;
+var<workgroup> wg_actual_min: atomic<u32>;
+var<workgroup> wg_idx_max: atomic<u32>;
+var<workgroup> wg_idx_min: atomic<u32>;
+var<workgroup> wg_unwritten: atomic<u32>;
+
 @compute @workgroup_size(64, 1, 1)
-fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, @builtin(local_invocation_index) local_index: u32) {
+    // reset the workgroup's statistics (64 invocations, 32 entries per array)
+    if local_index < 32u {
+        atomicStore(&wg_err_bit1_idx[local_index], 0u);
+        atomicStore(&wg_err_bitcount[local_index], 0u);
+        atomicStore(&wg_mem_bitcount[local_index], 0u);
+    } else if local_index == 32u {
+        atomicStore(&wg_errors, 0u);
+        atomicStore(&wg_actual_ff, 0u);
+        atomicStore(&wg_actual_max, 0u);
+        atomicStore(&wg_actual_min, 0xFFFFFFFFu);
+        atomicStore(&wg_idx_max, 0u);
+        atomicStore(&wg_idx_min, 0xFFFFFFFFu);
+        atomicStore(&wg_unwritten, 0u);
+    }
+    workgroupBarrier();
+
     let effective_addr = read_index(invocation_index(global_invocation_id));
     let actual_value : vec4<u32> = test[effective_addr];
     let expected_value : vec4<u32> = test_value_by_index(effective_addr);
@@ -141,37 +173,85 @@ fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
         // stale_mode: 0 - don't check, 1 - previous data as is, 2 - previous data inverted
         let stale_mask : u32 = select(0u, 0xFFFFFFFFu, io.stale_mode == 2u);
         let stale_value : vec4<u32> = pattern_value(effective_addr, io.prev_calc_param, io.prev_kind) ^ splat(stale_mask);
+        var errors = 0u;
+        var unwritten = 0u;
+        var idx_max = 0u;
+        var idx_min = 0xFFFFFFFFu;
         for(var i: i32 = 0; i < 4; i++) {
             let actual_u32 = actual_value[i];
             let error_mask = actual_u32 ^ expected_value[i];
             if error_mask == 0 {
                 continue;
             }
+            errors += 1u;
             if actual_u32 == WRITE_MARKER || (io.stale_mode != 0u && actual_u32 == stale_value[i]) {
-                atomicAdd(&io.unwritten_count, 1u);
+                unwritten += 1u;
             }
             let one_bits = countOneBits(error_mask);
             if one_bits == 1
             {
                 let bit_idx = firstLeadingBit(error_mask);
-                atomicAdd(&io.err_bit1_idx[bit_idx], 1u);
+                atomicAdd(&wg_err_bit1_idx[bit_idx], 1u);
             }
-            atomicAdd(&io.err_bitcount[one_bits % 32u], 1u);
+            atomicAdd(&wg_err_bitcount[one_bits % 32u], 1u);
             let vec_addr: u32 = effective_addr * 4u + u32(i);
-            atomicMax(&io.idx_max, vec_addr);
-            atomicMin(&io.idx_min, vec_addr);
-            atomicMax(&io.done_iter_or_err, 0xFFFFFFFFu); //ERROR_STATUS
+            idx_max = max(idx_max, vec_addr);
+            idx_min = min(idx_min, vec_addr);
             let actual_bits = countOneBits(actual_u32);
             if actual_bits == 32
             {
-                atomicAdd(&io.actual_ff, 1u);
+                atomicAdd(&wg_actual_ff, 1u);
             }
             else
             {
-                atomicAdd(&io.mem_bitcount[actual_bits], 1u);
-                atomicMax(&io.actual_max, actual_u32);
-                atomicMin(&io.actual_min, actual_u32);
+                atomicAdd(&wg_mem_bitcount[actual_bits], 1u);
+                atomicMax(&wg_actual_max, actual_u32);
+                atomicMin(&wg_actual_min, actual_u32);
             }
+        }
+        atomicAdd(&wg_errors, errors);
+        if unwritten != 0u {
+            atomicAdd(&wg_unwritten, unwritten);
+        }
+        atomicMax(&wg_idx_max, idx_max);
+        atomicMin(&wg_idx_min, idx_min);
+    }
+    workgroupBarrier();
+
+    // add the workgroup's statistics to the IO buffer, only if it found errors
+    if atomicLoad(&wg_errors) != 0u {
+        if local_index < 32u {
+            let bit1 = atomicLoad(&wg_err_bit1_idx[local_index]);
+            if bit1 != 0u {
+                atomicAdd(&io.err_bit1_idx[local_index], bit1);
+            }
+            let bitcount = atomicLoad(&wg_err_bitcount[local_index]);
+            if bitcount != 0u {
+                atomicAdd(&io.err_bitcount[local_index], bitcount);
+            }
+            let mem_bits = atomicLoad(&wg_mem_bitcount[local_index]);
+            if mem_bits != 0u {
+                atomicAdd(&io.mem_bitcount[local_index], mem_bits);
+            }
+        } else if local_index == 32u {
+            let actual_ff = atomicLoad(&wg_actual_ff);
+            if actual_ff != 0u {
+                atomicAdd(&io.actual_ff, actual_ff);
+            }
+            let unwritten = atomicLoad(&wg_unwritten);
+            if unwritten != 0u {
+                atomicAdd(&io.unwritten_count, unwritten);
+            }
+            // min > max: only FFFFFFFF-like wrong values, which don't update them
+            let actual_min = atomicLoad(&wg_actual_min);
+            let actual_max = atomicLoad(&wg_actual_max);
+            if actual_min <= actual_max {
+                atomicMax(&io.actual_max, actual_max);
+                atomicMin(&io.actual_min, actual_min);
+            }
+            atomicMax(&io.idx_max, atomicLoad(&wg_idx_max));
+            atomicMin(&io.idx_min, atomicLoad(&wg_idx_min));
+            atomicMax(&io.done_iter_or_err, 0xFFFFFFFFu); //ERROR_STATUS
         }
     }
     //assign done_iter_or_err only on specific index (performance reasons)

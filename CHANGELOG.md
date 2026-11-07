@@ -19,6 +19,7 @@ Changes in SadCryingDuck's fork of memtest_vulkan. Each release's notes on GitHu
 
 ### Fixes
 - Data lost during the load pause near the end of the test is reported as memory errors. Before, a big block of it could be reported as writes that never reached the memory (results invalid).
+- A check that finds very many wrong values is about 25 times faster. Each wrong value used to update the same few counters, so a window full of them took seconds to check, and the GPU driver could be reset (`ERROR_DEVICE_LOST`). The counts are now gathered per group of GPU threads first.
 
 ## v0.12.0-duck
 
