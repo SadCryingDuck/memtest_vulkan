@@ -25,7 +25,7 @@ version = '0.61.2'
 [target.'cfg(unix)'.dependencies.nix]
 default-features = false
 features = ['signal']
-version = '0.31.3'
+version = '0.32.0'
 
 
 # Vulkan bindings. Default features: "loaded" loads the system's Vulkan loader library at
